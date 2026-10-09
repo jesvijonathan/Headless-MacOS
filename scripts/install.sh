@@ -81,5 +81,10 @@ chmod 644 "$daemon"
 plutil -lint "$daemon" >/dev/null
 launchctl bootstrap system "$daemon"
 
+sleep 2
+agent=$(launchctl print "gui/$uid/dev.jesvi.headless" 2>/dev/null | awk '/^\tstate =/ {print $3; exit}')
+fan=$(launchctl print system/dev.jesvi.headless.fand 2>/dev/null | awk '/^\tstate =/ {print $3; exit}')
 echo "Installed $app, $plist and the fan daemon."
+echo "  agent:      ${agent:-not running}   (loads at the login window and in your session)"
+echo "  fan daemon: ${fan:-not running}   (starts at boot)"
 echo "If another fan tool (e.g. Macs Fan Control) is running, quit it or set it to Auto - two controllers will fight."

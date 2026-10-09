@@ -1487,7 +1487,7 @@ static BOOL ShowsStats(NSString *bundleID) {
 }
 
 - (void)present:(NSTouchBar *)bar {
-    if (!bar) return;
+    if (!bar || !self.tray) return;  // no tray item = no Touch Bar (or no private API): menu bar only
     [self registerTray];
     self.presentedBar = bar;
     self.presentedAt = [NSDate date];

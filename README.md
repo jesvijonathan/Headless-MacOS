@@ -53,6 +53,13 @@ full-width page. Tap the end icons for ±10%.
 
 ![Lock screen panel](docs/lock-panel.png)
 
+### Menu bar
+
+Everything is also in the menu bar (display icon): resolution and refresh rate, all three
+brightness sliders, fan modes with a custom speed, and every toggle and shortcut.
+
+<img src="docs/menu.png" alt="Menu bar menu" width="330">
+
 ### Shortcuts (⌃⌥⌘ +)
 
 | key | action | key | action |
@@ -61,7 +68,7 @@ full-width page. Tap the end icons for ±10%.
 | `↑` / `↓` | Touch Bar brightness ±10% | `H` | re-apply display settings |
 | `→` / `←` | keyboard backlight ±10% | `L` / `S` | lock / sleep display |
 | `A` | keep awake | `N` | Night Shift |
-| `F` | fans: Auto → Smart → Max | | |
+| `F` | fans: Auto → Smart → Max | `I` | show system stats |
 
 ### CLI
 
@@ -111,7 +118,7 @@ Anyone can read status, but only administrators can change modes. When it stops,
 uninstalling, the fans go back to macOS. In any mode it jumps to max fan speed if macOS
 reports a serious thermal state. Don't run it alongside another fan controller such as
 Macs Fan Control, because they'll fight. Smart mode reads sensors every 3 s, and fixed modes
-re-assert every 15 s. Auto does no work at all.
+re-assert every 30 s. Auto does no work at all.
 
 ## Limitations
 
@@ -124,7 +131,7 @@ re-assert every 15 s. Auto does no work at all.
   monitor supports DDC, a DDC tool such as MonitorControl gives true backlight control.
   Don't dim with both tools at once, or they'll fight over the gamma table.
 - **Fans:** fan control needs Apple Silicon (built and tested on M1). Smart mode uses the
-  90th percentile of the CPU/GPU die sensors.
+  mean of the 4 hottest CPU/GPU die sensors.
 - **Accessibility permission** (for mouse scroll reversal) is tied to the app's signature.
   Builds are ad-hoc signed, so after a rebuild and reinstall, untick and re-tick Headless in
   System Settings → Privacy & Security → Accessibility.

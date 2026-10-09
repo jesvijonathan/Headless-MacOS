@@ -476,6 +476,85 @@ static double MemoryUsage(void) {
     return used / (double)NSProcessInfo.processInfo.physicalMemory;
 }
 
+// Read-only SMC access: temperatures and fan speed need no privileges (only writes do,
+// which is why fan *control* lives in the root daemon).
+typedef struct {
+    uint32_t key;
+    struct { char major, minor, build, reserved; uint16_t release; } vers;
+    struct { uint16_t version, length; uint32_t cpuPLimit, gpuPLimit, memPLimit; } pLimitData;
+    struct { uint32_t dataSize, dataType; uint8_t dataAttributes; } keyInfo;
+    uint8_t result, status, data8;
+    uint32_t data32;
+    uint8_t bytes[32];
+} SMCParam;
+
+_Static_assert(sizeof(SMCParam) == 80, "AppleSMC expects an 80-byte parameter block");
+
+static io_connect_t SMCConnection(void) {
+    static io_connect_t connection;
+    if (!connection) {
+        io_service_t smc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"));
+        if (smc) { IOServiceOpen(smc, mach_task_self(), 0, &connection); IOObjectRelease(smc); }
+    }
+    return connection;
+}
+
+static BOOL SMCCall(SMCParam *in, SMCParam *out) {
+    size_t size = sizeof *out;
+    memset(out, 0, sizeof *out);
+    return SMCConnection() && IOConnectCallStructMethod(SMCConnection(), 2, in, sizeof *in, out, &size) == KERN_SUCCESS && out->result == 0;
+}
+
+static uint32_t FourCC(const char *s) { return (uint32_t)s[0] << 24 | (uint32_t)s[1] << 16 | (uint32_t)s[2] << 8 | (uint32_t)s[3]; }
+
+static double SMCRead(uint32_t key) {
+    SMCParam in = {.key = key, .data8 = 9}, info, out;  // 9: key info
+    if (!SMCCall(&in, &info)) return NAN;
+    in.keyInfo = info.keyInfo;
+    in.data8 = 5;  // 5: read bytes
+    if (!SMCCall(&in, &out)) return NAN;
+    uint32_t type = info.keyInfo.dataType;
+    if (type == FourCC("flt ") && info.keyInfo.dataSize == 4) { float f; memcpy(&f, out.bytes, 4); return f; }
+    if (type == FourCC("sp78")) return (int16_t)(out.bytes[0] << 8 | out.bytes[1]) / 256.0;
+    if (type == FourCC("fpe2")) return (out.bytes[0] << 6) + (out.bytes[1] >> 2);
+    if (type == FourCC("ui8 ")) return out.bytes[0];
+    if (type == FourCC("ui16")) return out.bytes[0] << 8 | out.bytes[1];
+    if (type == FourCC("ui32")) return (uint32_t)out.bytes[0] << 24 | (uint32_t)out.bytes[1] << 16 | (uint32_t)out.bytes[2] << 8 | out.bytes[3];
+    return NAN;
+}
+
+// CPU/GPU die sensors (Tc, Te, Tp, Tg), discovered once.
+static NSArray<NSNumber *> *SocSensors(void) {
+    static NSArray *sensors;
+    if (sensors) return sensors;
+    NSMutableArray *found = [NSMutableArray array];
+    double count = SMCRead(FourCC("#KEY"));
+    for (uint32_t i = 0; isfinite(count) && i < (uint32_t)count; i++) {
+        SMCParam in = {.data8 = 8, .data32 = i}, out;  // 8: key at index
+        if (!SMCCall(&in, &out)) continue;
+        char a = (char)(out.key >> 24), b = (char)(out.key >> 16);
+        if (a == 'T' && (b == 'c' || b == 'e' || b == 'p' || b == 'g')) {
+            double v = SMCRead(out.key);
+            if (v > 15 && v < 125) [found addObject:@(out.key)];
+        }
+    }
+    return sensors = found;
+}
+
+// Same measure as the fan daemon: 90th percentile of the SoC sensors.
+static double SocTemperature(void) {
+    NSMutableArray *values = [NSMutableArray array];
+    for (NSNumber *key in SocSensors()) {
+        double v = SMCRead(key.unsignedIntValue);
+        if (v > 15 && v < 125) [values addObject:@(v)];
+    }
+    if (!values.count) return NAN;
+    [values sortUsingSelector:@selector(compare:)];
+    return [values[MIN(values.count - 1, (NSUInteger)(values.count * 0.9))] doubleValue];
+}
+
+static double FanRPM(void) { return SMCRead(FourCC("F0Ac")); }
+
 static double GPUUsage(void) {
     io_iterator_t iterator;
     if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iterator) != KERN_SUCCESS) return NAN;
@@ -983,15 +1062,19 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     After(1, ^{ [self frontmostChanged:nil]; });
 }
 
-// The app area of the Touch Bar belongs to the frontmost app; at the desktop (Finder) show
-// stats there instead, and get out of the way as soon as any other app comes forward.
+// The app area of the Touch Bar belongs to the frontmost app; at the desktop (Finder) or in
+// the screensaver show stats there instead, and get out of the way for any other app.
+static BOOL ShowsStats(NSString *bundleID) {
+    return [@[@"com.apple.finder", @"com.apple.ScreenSaver.Engine"] containsObject:bundleID ?: @""];
+}
+
 - (void)frontmostChanged:(NSNotification *)note {
-    BOOL desktop = [NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier isEqualToString:@"com.apple.finder"];
+    BOOL desktop = ShowsStats(NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier);
     BOOL ourPanelInUse = self.presentedBar && self.presentedBar != self.statsBar && self.presentedAt.timeIntervalSinceNow > -60;
     if (desktop && SettingBool(@"DesktopStats", YES) && !ourPanelInUse) {
         // A bar presented while the previous one is still closing gets dropped; let it settle.
         After(0.5, ^{
-            if ([NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier isEqualToString:@"com.apple.finder"]) [self showStats:nil];
+            if (ShowsStats(NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier)) [self showStats:nil];
         });
     } else if (!desktop && self.presentedBar == self.statsBar) {
         [self hideStats];
@@ -1045,11 +1128,12 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     NSString *battery = BatteryText(&batterySymbol);
     self.statButtons[@"battery"].title = battery ?: @"–";
     self.statButtons[@"battery"].image = Symbol(batterySymbol, @"bolt.fill");
+    double temperature = SocTemperature(), rpm = FanRPM();
+    self.statButtons[@"temp"].title = isfinite(temperature) ? [NSString stringWithFormat:@"%.0f°", temperature] : @"–";
+    self.statButtons[@"fan"].title = isfinite(rpm) ? [NSString stringWithFormat:@"%.0f", rpm] : @"–";
     FanRequestAsync(@"status", ^(NSDictionary *status) {
-        NSDictionary *fan = [status[@"fans"] firstObject];
-        self.statButtons[@"temp"].title = status ? [NSString stringWithFormat:@"%.0f°", [status[@"temp"] doubleValue]] : @"–";
-        self.statButtons[@"fan"].title = fan ? [NSString stringWithFormat:@"%.0f", [fan[@"rpm"] doubleValue]] : @"–";
-        self.statButtons[@"fan"].contentTintColor = [status[@"mode"] isEqualToString:@"auto"] || !status ? nil : NSColor.systemBlueColor;
+        // Blue fan icon = Headless is controlling the fans (not Auto).
+        self.statButtons[@"fan"].contentTintColor = !status || [status[@"mode"] isEqualToString:@"auto"] ? nil : NSColor.systemBlueColor;
     });
 }
 
@@ -1659,6 +1743,8 @@ static int RunCLI(int argc, const char **argv) {
         printf("keyboard      %s saved, %.0f%% actual\n", HasSetting(@"KeyboardLevel") ? [NSString stringWithFormat:@"%.0f%%", SettingLevel(@"KeyboardLevel", 1.0) * 100].UTF8String : "not", KeyboardCurrent() * 100);
         printf("keep awake    %s\n", SettingBool(@"KeepAwake", YES) ? "on" : "off");
         printf("night shift   %s\n", NightShiftOn() ? "on" : "off");
+        printf("temperature   %.0f°C (SoC, %lu sensors)\n", SocTemperature(), (unsigned long)SocSensors().count);
+        printf("fan speed     %.0f rpm\n", FanRPM());
         NSDictionary *fans = FanRequest(@"status");
         printf("fans          %s%s\n", fans ? [FanModeTitle(fans[@"mode"]) stringByAppendingString:@", "].UTF8String : "", FanSummary(fans).UTF8String);
         return 0;

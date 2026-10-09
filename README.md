@@ -26,7 +26,7 @@ ControlStrip restarts and Touch Bar power events, and idles at 0% CPU.
 | **Touch Bar brightness** | Manual level, held across wake and ControlStrip restarts (no ambient sensor needed). |
 | **Keyboard backlight** | Manual level, restored on launch/wake only, so macOS idle dimming still works. |
 | **Monitor brightness** | Software dimming (gamma) for monitors without DDC, with a 12% floor so your only screen never goes black. Apple's Control Strip brightness button and the brightness keys drive it too. |
-| **Desktop stats** | When Finder is frontmost, the Touch Bar shows time · CPU · GPU · memory (GB and %) · temperature · fan RPM · network (or battery when unplugged/charging). Switching to any app gives the Touch Bar back. Tap the clock for the controls. |
+| **Desktop stats** | When Finder or the screensaver is frontmost, the Touch Bar shows time · CPU · GPU · memory (GB and %) · temperature · fan RPM · network (or battery when unplugged/charging). Switching to any app gives the Touch Bar back. Tap the clock for the controls. |
 | **Display modes** | Resolution and refresh-rate switching, including HiDPI modes. |
 | **Fan control** | Auto (macOS), Smart (temperature curve, 60–90 °C by default), Custom RPM, or Max. Runs from boot as a small root daemon. |
 | **Keep awake** | Prevents system sleep on AC power (like `caffeinate -s`); displays may still sleep. |

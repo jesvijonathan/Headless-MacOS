@@ -1,7 +1,8 @@
 // headless-fand — root fan daemon for Headless.
 //
 // Modes:  auto    macOS controls the fans (default)
-//         smart   temperature curve: minimum RPM below `low` °C (60), maximum at `high` °C (90)
+//         smart   temperature curve: minimum RPM below `low` °C (60), maximum at `high` °C (90),
+//                 using the mean of the 4 hottest SoC sensors
 //         custom  fixed RPM
 //         max     full blast
 //
@@ -41,10 +42,27 @@ let sensorKeys: [String] = smc.getAllKeys().filter { key in
         (smc.getValue(key).map { $0 > 15 && $0 < 125 } ?? false)
 }
 
-// 90th percentile of the SoC sensors: follows the busy cores without single-sensor spikes.
+// Temperature of the busy part of the chip: mean of the 4 hottest SoC sensors (same measure
+// as the agent's stats). Only the 8 sensors that were hottest at the last full scan are read
+// each tick; every 20th read rescans all of them.
+var hotSensors: [String] = []
+var readsSinceScan = 0
+
 func hottest() -> Double? {
-    let values = sensorKeys.compactMap { smc.getValue($0) }.filter { $0 > 15 && $0 < 125 }.sorted()
-    return values.isEmpty ? nil : values[Swift.min(values.count - 1, Int(Double(values.count) * 0.9))]
+    var readings: [Double]
+    readsSinceScan += 1
+    if hotSensors.isEmpty || readsSinceScan >= 20 {
+        readsSinceScan = 0
+        let all = sensorKeys.compactMap { key in smc.getValue(key).map { (key, $0) } }
+            .filter { $0.1 > 15 && $0.1 < 125 }.sorted { $0.1 > $1.1 }.prefix(8)
+        hotSensors = all.map { $0.0 }
+        readings = all.map { $0.1 }
+    } else {
+        readings = hotSensors.compactMap { smc.getValue($0) }.filter { $0 > 15 && $0 < 125 }.sorted(by: >)
+    }
+    guard !readings.isEmpty else { return nil }
+    let top = readings.prefix(4)
+    return top.reduce(0, +) / Double(top.count)
 }
 
 // MARK: - State
@@ -70,6 +88,8 @@ func save() {
 var smoothedTemp: Double?
 var lastTargets: [Int: Double] = [:]
 var timer: DispatchSourceTimer?
+var interval = 3.0
+var stableTicks = 0
 
 var thermalEmergency: Bool {
     let t = ProcessInfo.processInfo.thermalState
@@ -100,8 +120,16 @@ func target(for fan: Fan) -> Double {
 
 func tick() {
     if state.mode == "auto" && !thermalEmergency { return }
-    if state.mode == "smart" {
-        if let t = hottest() { smoothedTemp = smoothedTemp.map { $0 * 0.6 + t * 0.4 } ?? t }
+    if state.mode == "smart", let t = hottest() {
+        let previous = smoothedTemp
+        smoothedTemp = previous.map { $0 * 0.6 + t * 0.4 } ?? t
+        // Follow the temperature every 3 s while it moves; every 6 s once it has settled.
+        stableTicks = previous.map { abs($0 - smoothedTemp!) < 0.5 } == true ? stableTicks + 1 : 0
+        let wanted: Double = stableTicks >= 5 ? 6 : 3
+        if wanted != interval {
+            interval = wanted
+            timer?.schedule(deadline: .now() + wanted, repeating: wanted, leeway: .seconds(1))
+        }
     }
     for fan in fans {
         let rpm = target(for: fan)
@@ -112,8 +140,8 @@ func tick() {
     }
 }
 
-// Smart mode follows temperature every 3 s; fixed modes only re-assert every 15 s
-// (sleep/wake can reset the SMC). Auto does nothing at all.
+// Smart mode follows temperature every 3–6 s; fixed modes only re-assert every 30 s
+// (wake is handled separately). Auto does nothing at all.
 func reschedule() {
     timer?.cancel()
     timer = nil
@@ -121,9 +149,10 @@ func reschedule() {
         handBack()
         return
     }
-    let interval: Double = state.mode == "smart" ? 3 : 15
+    interval = state.mode == "smart" ? 3 : 30
+    stableTicks = 0
     let source = DispatchSource.makeTimerSource(queue: queue)
-    source.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(500))
+    source.schedule(deadline: .now(), repeating: interval, leeway: .seconds(state.mode == "smart" ? 1 : 5))
     source.setEventHandler(handler: tick)
     source.resume()
     timer = source

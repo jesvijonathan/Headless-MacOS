@@ -508,14 +508,22 @@ static BOOL SMCCall(SMCParam *in, SMCParam *out) {
 
 static uint32_t FourCC(const char *s) { return (uint32_t)s[0] << 24 | (uint32_t)s[1] << 16 | (uint32_t)s[2] << 8 | (uint32_t)s[3]; }
 
-static double SMCRead(uint32_t key) {
-    SMCParam in = {.key = key, .data8 = 9}, info, out;  // 9: key info
-    if (!SMCCall(&in, &info)) return NAN;
-    in.keyInfo = info.keyInfo;
-    in.data8 = 5;  // 5: read bytes
+// Key info looked up once per key, so each later read is a single kernel call.
+typedef struct { uint32_t key, size, type; } SMCKey;
+
+static BOOL SMCLookup(uint32_t key, SMCKey *out) {
+    SMCParam in = {.key = key, .data8 = 9}, info;  // 9: key info
+    if (!SMCCall(&in, &info)) return NO;
+    *out = (SMCKey){key, info.keyInfo.dataSize, info.keyInfo.dataType};
+    return YES;
+}
+
+static double SMCValue(const SMCKey *k) {
+    SMCParam in = {.key = k->key, .data8 = 5}, out;  // 5: read bytes
+    in.keyInfo.dataSize = k->size;
     if (!SMCCall(&in, &out)) return NAN;
-    uint32_t type = info.keyInfo.dataType;
-    if (type == FourCC("flt ") && info.keyInfo.dataSize == 4) { float f; memcpy(&f, out.bytes, 4); return f; }
+    uint32_t type = k->type;
+    if (type == FourCC("flt ") && k->size == 4) { float f; memcpy(&f, out.bytes, 4); return f; }
     if (type == FourCC("sp78")) return (int16_t)(out.bytes[0] << 8 | out.bytes[1]) / 256.0;
     if (type == FourCC("fpe2")) return (out.bytes[0] << 6) + (out.bytes[1] >> 2);
     if (type == FourCC("ui8 ")) return out.bytes[0];
@@ -524,51 +532,97 @@ static double SMCRead(uint32_t key) {
     return NAN;
 }
 
+static double SMCRead(uint32_t key) {
+    SMCKey k;
+    return SMCLookup(key, &k) ? SMCValue(&k) : NAN;
+}
+
 // CPU/GPU die sensors (Tc, Te, Tp, Tg), discovered once.
-static NSArray<NSNumber *> *SocSensors(void) {
-    static NSArray *sensors;
-    if (sensors) return sensors;
-    NSMutableArray *found = [NSMutableArray array];
+enum { MaxSensors = 160, HotSensors = 8 };
+static SMCKey gSensors[MaxSensors];
+static int gSensorCount = -1;
+
+static int SensorCount(void) {
+    if (gSensorCount >= 0) return gSensorCount;
+    gSensorCount = 0;
     double count = SMCRead(FourCC("#KEY"));
-    for (uint32_t i = 0; isfinite(count) && i < (uint32_t)count; i++) {
+    for (uint32_t i = 0; isfinite(count) && i < (uint32_t)count && gSensorCount < MaxSensors; i++) {
         SMCParam in = {.data8 = 8, .data32 = i}, out;  // 8: key at index
         if (!SMCCall(&in, &out)) continue;
         char a = (char)(out.key >> 24), b = (char)(out.key >> 16);
-        if (a == 'T' && (b == 'c' || b == 'e' || b == 'p' || b == 'g')) {
-            double v = SMCRead(out.key);
-            if (v > 15 && v < 125) [found addObject:@(out.key)];
+        SMCKey k;
+        if (a == 'T' && (b == 'c' || b == 'e' || b == 'p' || b == 'g') && SMCLookup(out.key, &k)) {
+            double v = SMCValue(&k);
+            if (v > 15 && v < 125) gSensors[gSensorCount++] = k;
         }
     }
-    return sensors = found;
+    return gSensorCount;
 }
 
-// Same measure as the fan daemon: 90th percentile of the SoC sensors.
+static int CompareDescending(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+// Temperature of the busy part of the chip: mean of the 4 hottest SoC sensors. Each SMC read
+// is a kernel round trip to the SMC (~170 µs), so only the 8 that were hottest at the last
+// full scan are read; a full rescan every 30 calls keeps that set honest.
 static double SocTemperature(void) {
-    NSMutableArray *values = [NSMutableArray array];
-    for (NSNumber *key in SocSensors()) {
-        double v = SMCRead(key.unsignedIntValue);
-        if (v > 15 && v < 125) [values addObject:@(v)];
+    static int hot[HotSensors], hotCount, sinceScan;
+    int n = SensorCount();
+    if (!n) return NAN;
+    double values[MaxSensors];
+    int read = 0;
+    if (!hotCount || ++sinceScan >= 30) {
+        sinceScan = 0;
+        double ranked[MaxSensors][2];
+        for (int i = 0; i < n; i++) { ranked[i][0] = SMCValue(&gSensors[i]); ranked[i][1] = i; }
+        qsort(ranked, (size_t)n, sizeof ranked[0], CompareDescending);
+        hotCount = 0;
+        for (int i = 0; i < n && hotCount < HotSensors; i++) {
+            if (!(ranked[i][0] > 15 && ranked[i][0] < 125)) continue;
+            hot[hotCount++] = (int)ranked[i][1];
+            values[read++] = ranked[i][0];
+        }
+    } else {
+        for (int i = 0; i < hotCount; i++) {
+            double v = SMCValue(&gSensors[hot[i]]);
+            if (v > 15 && v < 125) values[read++] = v;
+        }
     }
-    if (!values.count) return NAN;
-    [values sortUsingSelector:@selector(compare:)];
-    return [values[MIN(values.count - 1, (NSUInteger)(values.count * 0.9))] doubleValue];
+    if (!read) return NAN;
+    qsort(values, (size_t)read, sizeof values[0], CompareDescending);
+    double sum = 0;
+    int top = read < 4 ? read : 4;
+    for (int i = 0; i < top; i++) sum += values[i];
+    return sum / top;
 }
 
-static double FanRPM(void) { return SMCRead(FourCC("F0Ac")); }
+static NSUInteger SocSensorCount(void) { return (NSUInteger)SensorCount(); }
+
+static double FanRPM(void) {
+    static SMCKey fan;
+    if (!fan.key && !SMCLookup(FourCC("F0Ac"), &fan)) return NAN;
+    return SMCValue(&fan);
+}
 
 static double GPUUsage(void) {
-    io_iterator_t iterator;
-    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iterator) != KERN_SUCCESS) return NAN;
-    double usage = NAN;
-    io_object_t service;
-    while ((service = IOIteratorNext(iterator))) {
-        NSDictionary *stats = CFBridgingRelease(IORegistryEntryCreateCFProperty(service, CFSTR("PerformanceStatistics"), kCFAllocatorDefault, 0));
-        NSNumber *percent = [stats isKindOfClass:NSDictionary.class] ? stats[@"Device Utilization %"] : nil;
-        if ([percent isKindOfClass:NSNumber.class]) usage = fmax(isnan(usage) ? 0 : usage, percent.doubleValue / 100);
-        IOObjectRelease(service);
+    static io_service_t gpu;  // the accelerator that reports utilisation, found once
+    if (!gpu) {
+        io_iterator_t iterator;
+        if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iterator) != KERN_SUCCESS) return NAN;
+        io_object_t service;
+        while ((service = IOIteratorNext(iterator))) {
+            CFTypeRef stats = IORegistryEntryCreateCFProperty(service, CFSTR("PerformanceStatistics"), kCFAllocatorDefault, 0);
+            if (stats && !gpu) gpu = service; else IOObjectRelease(service);
+            if (stats) CFRelease(stats);
+        }
+        IOObjectRelease(iterator);
+        if (!gpu) return NAN;
     }
-    IOObjectRelease(iterator);
-    return usage;
+    NSDictionary *stats = CFBridgingRelease(IORegistryEntryCreateCFProperty(gpu, CFSTR("PerformanceStatistics"), kCFAllocatorDefault, 0));
+    NSNumber *percent = [stats isKindOfClass:NSDictionary.class] ? stats[@"Device Utilization %"] : nil;
+    return [percent isKindOfClass:NSNumber.class] ? percent.doubleValue / 100 : NAN;
 }
 
 // Bytes/s in and out across all non-loopback interfaces since the previous call.
@@ -748,6 +802,117 @@ static NSImage *Symbol(NSString *name, NSString *fallback) {
         ?: (fallback ? [NSImage imageWithSystemSymbolName:fallback accessibilityDescription:nil] : nil);
 }
 
+// The desktop stats row, drawn as one view. Seven buttons cost an Auto Layout pass and a
+// font lookup per label per tick; this draws text and cached icons directly and only when a
+// value actually changed. Taps are mapped to segments by position.
+@interface HKStatsView : NSView
+@property (copy) void (^tapped)(NSString *segment);
+@property (nonatomic, copy) NSArray<NSString *> *segments;
+- (void)setText:(NSString *)text forSegment:(NSString *)segment;
+- (void)setSymbol:(NSString *)symbol tint:(NSColor *)tint forSegment:(NSString *)segment;
+@end
+
+@implementation HKStatsView {
+    NSMutableDictionary<NSString *, NSString *> *_texts;
+    NSMutableDictionary<NSString *, NSImage *> *_icons;
+    NSDictionary *_textAttributes, *_clockAttributes;
+}
+
+static const CGFloat StatsGap = 8;
+
+static NSDictionary<NSString *, NSArray *> *StatSegments(void) {  // key → @[default symbol, width]
+    static NSDictionary *segments;
+    if (!segments) segments = @{
+        @"clock": @[@"", @110], @"cpu": @[@"cpu", @60], @"gpu": @[@"cube.transparent", @58],
+        @"memory": @[@"memorychip", @100], @"temp": @[@"thermometer.medium", @54], @"fan": @[@"fan.fill", @68],
+        @"network": @[@"", @92], @"battery": @[@"battery.100", @92],
+    };
+    return segments;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        _texts = [NSMutableDictionary dictionary];
+        _icons = [NSMutableDictionary dictionary];
+        NSColor *white = [NSColor colorWithWhite:1 alpha:0.92];
+        _textAttributes = @{NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular], NSForegroundColorAttributeName: white};
+        _clockAttributes = @{NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightMedium], NSForegroundColorAttributeName: white};
+        self.allowedTouchTypes = NSTouchTypeMaskDirect;
+    }
+    return self;
+}
+
+- (void)setSegments:(NSArray<NSString *> *)segments {
+    _segments = [segments copy];
+    for (NSString *key in segments)
+        if (!_icons[key] && [StatSegments()[key][0] length]) [self setSymbol:StatSegments()[key][0] tint:nil forSegment:key];
+    [self invalidateIntrinsicContentSize];
+    self.needsDisplay = YES;
+}
+
+- (NSSize)intrinsicContentSize {
+    CGFloat width = 0;
+    for (NSString *key in self.segments) width += [StatSegments()[key][1] doubleValue] + StatsGap;
+    return NSMakeSize(width, 30);
+}
+
+- (NSRect)rectForSegment:(NSString *)segment {
+    CGFloat x = 0;
+    for (NSString *key in self.segments) {
+        CGFloat width = [StatSegments()[key][1] doubleValue];
+        if ([key isEqualToString:segment]) return NSMakeRect(x, 0, width, NSHeight(self.bounds));
+        x += width + StatsGap;
+    }
+    return NSZeroRect;
+}
+
+- (void)setText:(NSString *)text forSegment:(NSString *)segment {
+    if ([_texts[segment] isEqualToString:text]) return;
+    _texts[segment] = text;
+    [self setNeedsDisplayInRect:[self rectForSegment:segment]];  // repaint just this segment
+}
+
+- (void)setSymbol:(NSString *)symbol tint:(NSColor *)tint forSegment:(NSString *)segment {
+    NSImageSymbolConfiguration *config = [[NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular]
+        configurationByApplyingConfiguration:[NSImageSymbolConfiguration configurationWithPaletteColors:@[tint ?: [NSColor colorWithWhite:1 alpha:0.92]]]];
+    _icons[segment] = [Symbol(symbol, @"circle") imageWithSymbolConfiguration:config];
+    [self setNeedsDisplayInRect:[self rectForSegment:segment]];
+}
+
+- (void)drawRect:(NSRect)dirty {
+    CGFloat x = 0, mid = NSMidY(self.bounds);
+    for (NSString *key in self.segments) {
+        CGFloat width = [StatSegments()[key][1] doubleValue], textX = x;
+        if (![self needsToDrawRect:NSMakeRect(x, 0, width + StatsGap, NSHeight(self.bounds))]) { x += width + StatsGap; continue; }
+        NSImage *icon = _icons[key];
+        if (icon) {
+            NSSize size = icon.size;
+            [icon drawInRect:NSMakeRect(x, round(mid - size.height / 2), size.width, size.height)];
+            textX += size.width + 5;
+        }
+        BOOL clock = [key isEqualToString:@"clock"];
+        NSDictionary *attributes = clock ? _clockAttributes : _textAttributes;
+        NSString *text = _texts[key] ?: @"–";
+        NSSize size = [text sizeWithAttributes:attributes];
+        [text drawAtPoint:NSMakePoint(textX, round(mid - size.height / 2)) withAttributes:attributes];
+        if (clock) {  // separator after the clock
+            [[NSColor colorWithWhite:1 alpha:0.25] setFill];
+            NSRectFill(NSMakeRect(x + width + StatsGap / 2 - 0.5, mid - 10, 1, 20));
+        }
+        x += width + StatsGap;
+    }
+}
+
+- (void)touchesEndedWithEvent:(NSEvent *)event {
+    NSTouch *touch = [[event touchesMatchingPhase:NSTouchPhaseEnded inView:self] anyObject];
+    CGFloat at = [touch locationInView:self].x, x = 0;
+    for (NSString *key in self.segments) {
+        x += [StatSegments()[key][1] doubleValue] + StatsGap;
+        if (at < x) { if (self.tapped) self.tapped(key); return; }
+    }
+}
+@end
+
 typedef NS_ENUM(UInt32, HKHotKey) {
     HKTouchBarUp = 1, HKTouchBarDown, HKKeyboardUp, HKKeyboardDown,
     HKShowControls, HKReapply, HKLock, HKSleepDisplays, HKToggleAwake, HKToggleNightShift,
@@ -777,7 +942,7 @@ typedef NS_ENUM(UInt32, HKHotKey) {
 @property NSDictionary *fanStatus;
 @property NSDate *fanRefreshUntil;
 @property NSTouchBar *statsBar;
-@property NSDictionary<NSString *, NSButton *> *statButtons;
+@property HKStatsView *statsView;
 @property NSTimer *statsTimer;
 @property NSTouchBar *presentedBar;
 @property NSDate *presentedAt;
@@ -949,27 +1114,6 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     }
     if (showCloseBox) showCloseBox(YES);
 
-    NSSlider *slider;
-    NSCustomTouchBarItem *touchBarItem = [self slider:&slider width:320 min:@"sun.min" max:@"sun.max.fill" label:@"Touch Bar Brightness" action:@selector(touchBarSliderMoved:)];
-    self.touchBarSlider = slider;
-    NSCustomTouchBarItem *keyboardItem = [self slider:&slider width:320 min:@"light.min" max:@"light.max" label:@"Keyboard Backlight" action:@selector(keyboardSliderMoved:)];
-    self.keyboardSlider = slider;
-    self.touchBarValue = [self valueLabel];
-    self.keyboardValue = [self valueLabel];
-    self.touchBarPage = [self sliderPage:touchBarItem value:self.touchBarValue];
-    self.keyboardPage = [self sliderPage:keyboardItem value:self.keyboardValue];
-    NSCustomTouchBarItem *monitorItem = [self slider:&slider width:180 min:@"sun.min" max:@"sun.max.fill" label:@"Monitor Brightness" action:@selector(monitorSliderMoved:)];
-    self.monitorSlider = slider;
-    self.monitorValue = [self valueLabel];
-    self.monitorPage = [NSTouchBar new];
-    self.monitorPage.templateItems = [NSSet setWithArray:@[
-        [self item:@"back" view:[self barButton:@"chevron.left" fallback:nil title:nil action:@selector(showMainPage:)] label:@"Back"],
-        monitorItem,
-        [self item:@"value" view:self.monitorValue label:@"Level"],
-        [self item:@"sleep" view:[self fixedWidth:96 button:[self barButton:@"zzz" fallback:@"powersleep" title:@"Sleep" action:@selector(sleepDisplays:)]] label:@"Sleep Display"],
-        [self item:@"modes" view:[self fixedWidth:100 button:[self barButton:@"rectangle.expand.vertical" fallback:@"aspectratio" title:@"Modes" action:@selector(showDisplayPage:)]] label:@"Resolution"],
-    ]];
-    self.monitorPage.defaultItemIdentifiers = @[@"back", @"slider", @"value", NSTouchBarItemIdentifierFixedSpaceSmall, @"sleep", @"modes"];
     self.displayButton = [self barButton:@"display" fallback:nil title:@"Monitor" action:@selector(showMonitorPage:)];
     self.awakeButton = [self barButton:@"cup.and.saucer.fill" fallback:@"bolt.fill" title:@"Awake" action:@selector(toggleAwake:)];
     self.nightShiftButton = [self barButton:@"moon.fill" fallback:nil title:@"Night" action:@selector(toggleNightShift:)];
@@ -997,36 +1141,12 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     self.mainBar.templateItems = [NSSet setWithArray:mainItems];
     self.mainBar.defaultItemIdentifiers = @[@"tb", @"kb", @"display", @"nightshift", @"awake", @"fans"];
 
-    [self buildFanPages];
     [self buildStatsBar];
-
-    self.headlessButton = [self barButton:@"laptopcomputer" fallback:nil title:@"Built-in Off" action:@selector(toggleHeadless:)];
-    NSScrubberFlowLayout *layout = [NSScrubberFlowLayout new];
-    layout.itemSpacing = 6;
-    self.modeScrubber = [[NSScrubber alloc] initWithFrame:NSMakeRect(0, 0, 320, 30)];
-    self.modeScrubber.scrubberLayout = layout;
-    self.modeScrubber.mode = NSScrubberModeFree;
-    self.modeScrubber.selectionBackgroundStyle = NSScrubberSelectionStyle.roundedBackgroundStyle;
-    self.modeScrubber.showsAdditionalContentIndicators = YES;
-    self.modeScrubber.dataSource = self;
-    self.modeScrubber.delegate = self;
-    [self.modeScrubber registerClass:NSScrubberTextItemView.class forItemIdentifier:@"mode"];
-    [self.modeScrubber.widthAnchor constraintEqualToConstant:320].active = YES;
-    NSArray *displayItems = @[
-        [self item:@"back" view:[self barButton:@"chevron.left" fallback:nil title:nil action:@selector(showMonitorPage:)] label:@"Back"],
-        [self item:@"headless" view:self.headlessButton label:@"Built-in Display"],
-        [self item:@"redetect" view:[self barButton:@"arrow.clockwise" fallback:nil title:nil action:@selector(reapply:)] label:@"Re-detect Displays"],
-        [self item:@"modes" view:self.modeScrubber label:@"Resolution"],
-    ];
-    self.displayBar = [NSTouchBar new];
-    self.displayBar.templateItems = [NSSet setWithArray:displayItems];
-    self.displayBar.defaultItemIdentifiers = @[@"back", @"headless", @"redetect", NSTouchBarItemIdentifierFixedSpaceSmall, @"modes"];
 
     self.tray = [[NSCustomTouchBarItem alloc] initWithIdentifier:TrayID];
     self.tray.view = [self barButton:@"slider.horizontal.3" fallback:nil title:nil action:@selector(showControls:)];
     self.tray.view.accessibilityLabel = @"Headless controls";
-    [self watchVisibility:@[self.mainBar, self.displayBar, self.touchBarPage, self.keyboardPage, self.monitorPage,
-                            self.fanPage, self.fanCustomPage, self.statsBar]];
+    [self watchVisibility:@[self.mainBar, self.statsBar]];
     // ControlStrip resolves private tray items through the app's current Touch Bar.
     NSApp.touchBar = self.mainBar;
     [self refreshControls];
@@ -1055,6 +1175,7 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
 
 // ‹  Auto  Smart  Custom  Max      1650 rpm · 63°
 - (void)buildFanPages {
+    if (self.fanPage) return;
     NSMutableDictionary *buttons = [NSMutableDictionary dictionary];
     NSMutableArray *items = [NSMutableArray arrayWithObject:
         [self item:@"back" view:[self barButton:@"chevron.left" fallback:nil title:nil action:@selector(showMainPage:)] label:@"Back"]];
@@ -1090,39 +1211,16 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
 
 // ⚙︎  CPU 12%  Mem 54%  63°  1650 rpm  100%   — shown while the desktop (Finder) is frontmost
 - (void)buildStatsBar {
-    NSMutableDictionary *buttons = [NSMutableDictionary dictionary];
-    NSMutableArray *items = [NSMutableArray array];
-    NSArray *specs = @[
-        @[@"clock", @"", @"showControls:", @104],
-        @[@"cpu", @"cpu", @"openActivityMonitor:", @60],
-        @[@"gpu", @"cube.transparent", @"openActivityMonitor:", @58],
-        @[@"memory", @"memorychip", @"openActivityMonitor:", @100],
-        @[@"temp", @"thermometer.medium", @"showFanPage:", @54],
-        @[@"fan", @"fan.fill", @"showFanPage:", @68],
-        @[@"network", @"", @"openActivityMonitor:", @92],
-        @[@"battery", @"battery.100", @"showControls:", @92],
-    ];
-    for (NSArray *spec in specs) {
-        BOOL clock = [spec[0] isEqualToString:@"clock"];
-        NSButton *button = [spec[1] length] == 0 ? [NSButton buttonWithTitle:@"–" target:self action:NSSelectorFromString(spec[2])]
-                                 : [self barButton:spec[1] fallback:@"circle" title:@"–" action:NSSelectorFromString(spec[2])];
-        button.font = [NSFont monospacedDigitSystemFontOfSize:13 weight:clock ? NSFontWeightMedium : NSFontWeightRegular];
-        button.imageHugsTitle = YES;
-        button.bordered = NO;  // the clock also opens the controls; plain text, like the stats
-        [button.widthAnchor constraintEqualToConstant:[spec[3] doubleValue]].active = YES;
-        buttons[spec[0]] = button;
-        [items addObject:[self item:spec[0] view:button label:spec[0]]];
-    }
-    self.statButtons = buttons;
-    NSView *separator = [NSView new];
-    separator.wantsLayer = YES;
-    separator.layer.backgroundColor = NSColor.tertiaryLabelColor.CGColor;
-    [separator.widthAnchor constraintEqualToConstant:1].active = YES;
-    [separator.heightAnchor constraintEqualToConstant:20].active = YES;
-    [items addObject:[self item:@"separator" view:separator label:@"Separator"]];
+    self.statsView = [[HKStatsView alloc] initWithFrame:NSMakeRect(0, 0, 600, 30)];
+    __weak HKApp *weakSelf = self;
+    self.statsView.tapped = ^(NSString *segment) {
+        if ([segment isEqualToString:@"clock"] || [segment isEqualToString:@"battery"]) [weakSelf showControls:nil];
+        else if ([segment isEqualToString:@"temp"] || [segment isEqualToString:@"fan"]) [weakSelf showFanPage:nil];
+        else [weakSelf openActivityMonitor:nil];
+    };
     self.statsBar = [NSTouchBar new];
-    self.statsBar.templateItems = [NSSet setWithArray:items];
-    self.statsBar.defaultItemIdentifiers = @[@"clock", @"separator", @"cpu", @"gpu", @"memory", @"temp", @"fan", @"network"];
+    self.statsBar.templateItems = [NSSet setWithObject:[self item:@"stats" view:self.statsView label:@"System Stats"]];
+    self.statsBar.defaultItemIdentifiers = @[@"stats"];
     [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(frontmostChanged:) name:NSWorkspaceDidActivateApplicationNotification object:nil];
     After(1, ^{ [self frontmostChanged:nil]; });
 }
@@ -1152,13 +1250,14 @@ static BOOL ShowsStats(NSString *bundleID) {
     // Battery takes the network slot when it matters (on battery or charging).
     NSString *symbol;
     BOOL battery = BatteryText(&symbol) != nil;
-    self.statsBar.defaultItemIdentifiers = @[@"clock", @"separator", @"cpu", @"gpu", @"memory", @"temp", @"fan", battery ? @"battery" : @"network"];
-    for (NSString *key in @[@"cpu", @"gpu", @"memory", @"network"]) self.statButtons[key].title = @"–";
+    self.statsView.segments = @[@"clock", @"cpu", @"gpu", @"memory", @"temp", @"fan", battery ? @"battery" : @"network"];
+    for (NSString *key in @[@"cpu", @"gpu", @"memory", @"network"]) [self.statsView setText:@"–" forSegment:key];
     double down, up;
     CPUUsage();  // prime the deltas; first real values arrive with the first tick
     NetworkRates(&down, &up);
     [self present:self.statsBar];
     After(0.6, ^{ [self updateStats]; });
+    FanRequestAsync(@"status", ^(NSDictionary *status) { [self tintFanStat:status]; });
     [self.statsTimer invalidate];
     self.statsTimer = [NSTimer scheduledTimerWithTimeInterval:2 repeats:YES block:^(NSTimer *t) { [self updateStats]; }];
     self.statsTimer.tolerance = 0.5;
@@ -1180,27 +1279,29 @@ static BOOL ShowsStats(NSString *bundleID) {
         date = [NSDateFormatter new];
         [date setLocalizedDateFormatFromTemplate:@"EEEd"];
     }
+    HKStatsView *view = self.statsView;
     NSDate *now = [NSDate date];
-    self.statButtons[@"clock"].title = [NSString stringWithFormat:@"%@ · %@", [time stringFromDate:now], [date stringFromDate:now]];
-    double cpu = CPUUsage(), memory = MemoryUsage();
-    self.statButtons[@"cpu"].title = isfinite(cpu) ? [NSString stringWithFormat:@"%.0f%%", cpu * 100] : @"–";
+    [view setText:[NSString stringWithFormat:@"%@ · %@", [time stringFromDate:now], [date stringFromDate:now]] forSegment:@"clock"];
+    static unsigned tick;
+    double cpu = CPUUsage(), memory = MemoryUsage(), gpu = GPUUsage(), rpm = FanRPM();
+    double temperature = tick++ % 2 == 0 ? SocTemperature() : NAN;  // every other tick is plenty
+    [view setText:isfinite(cpu) ? [NSString stringWithFormat:@"%.0f%%", cpu * 100] : @"–" forSegment:@"cpu"];
+    [view setText:isfinite(gpu) ? [NSString stringWithFormat:@"%.0f%%", gpu * 100] : @"–" forSegment:@"gpu"];
     double memoryGB = memory * NSProcessInfo.processInfo.physicalMemory / 1073741824.0;
-    self.statButtons[@"memory"].title = isfinite(memory) ? [NSString stringWithFormat:@"%.1fG | %.0f%%", memoryGB, memory * 100] : @"–";
-    double gpu = GPUUsage(), down, up;
-    self.statButtons[@"gpu"].title = isfinite(gpu) ? [NSString stringWithFormat:@"%.0f%%", gpu * 100] : @"–";
-    NetworkRates(&down, &up);
-    self.statButtons[@"network"].title = [NSString stringWithFormat:@"↓%@ ↑%@", RateText(down), RateText(up)];
-    NSString *batterySymbol = @"battery.100";
-    NSString *battery = BatteryText(&batterySymbol);
-    self.statButtons[@"battery"].title = battery ?: @"–";
-    self.statButtons[@"battery"].image = Symbol(batterySymbol, @"bolt.fill");
-    double temperature = SocTemperature(), rpm = FanRPM();
-    self.statButtons[@"temp"].title = isfinite(temperature) ? [NSString stringWithFormat:@"%.0f°", temperature] : @"–";
-    self.statButtons[@"fan"].title = isfinite(rpm) ? [NSString stringWithFormat:@"%.0f", rpm] : @"–";
-    FanRequestAsync(@"status", ^(NSDictionary *status) {
-        // Blue fan icon = Headless is controlling the fans (not Auto).
-        self.statButtons[@"fan"].contentTintColor = !status || [status[@"mode"] isEqualToString:@"auto"] ? nil : NSColor.systemBlueColor;
-    });
+    [view setText:isfinite(memory) ? [NSString stringWithFormat:@"%.1fG | %.0f%%", memoryGB, memory * 100] : @"–" forSegment:@"memory"];
+    if (isfinite(temperature)) [view setText:[NSString stringWithFormat:@"%.0f°", temperature] forSegment:@"temp"];
+    [view setText:isfinite(rpm) ? [NSString stringWithFormat:@"%.0f", rpm] : @"–" forSegment:@"fan"];
+    if ([view.segments containsObject:@"network"]) {
+        double down, up;
+        NetworkRates(&down, &up);
+        [view setText:[NSString stringWithFormat:@"↓%@ ↑%@", RateText(down), RateText(up)] forSegment:@"network"];
+    } else {
+        NSString *symbol = @"battery.100";
+        NSString *battery = BatteryText(&symbol);
+        [view setText:battery ?: @"–" forSegment:@"battery"];
+        static NSString *shownSymbol;
+        if (![symbol isEqualToString:shownSymbol]) { shownSymbol = symbol; [view setSymbol:symbol tint:nil forSegment:@"battery"]; }
+    }
 }
 
 - (void)openActivityMonitor:(id)sender {
@@ -1225,6 +1326,8 @@ static BOOL ShowsStats(NSString *bundleID) {
 }
 
 - (void)showFanPage:(id)sender {
+    [self buildFanPages];
+    [self watchVisibility:@[self.fanPage, self.fanCustomPage]];
     [self present:self.fanPage];
     self.fanRefreshUntil = [NSDate dateWithTimeIntervalSinceNow:60];
     [self refreshFans];
@@ -1238,8 +1341,14 @@ static BOOL ShowsStats(NSString *bundleID) {
     });
 }
 
+// Blue fan icon in the stats bar = Headless is controlling the fans (not Auto).
+- (void)tintFanStat:(NSDictionary *)status {
+    [self.statsView setSymbol:@"fan.fill" tint:!status || [status[@"mode"] isEqualToString:@"auto"] ? nil : NSColor.systemBlueColor forSegment:@"fan"];
+}
+
 - (void)showFanStatus:(NSDictionary *)status {
     self.fanStatus = status;
+    [self tintFanStat:status];
     self.fanReadout.stringValue = FanSummary(status);
     for (NSString *mode in self.fanModeButtons) {
         NSButton *button = self.fanModeButtons[mode];
@@ -1287,7 +1396,77 @@ static BOOL ShowsStats(NSString *bundleID) {
 // Closing a system-modal bar (✕, app switch, dismiss) drops our Control Strip item, so
 // re-register whenever one of our bars stops being visible.
 - (void)watchVisibility:(NSArray<NSTouchBar *> *)bars {
-    for (NSTouchBar *bar in bars) [bar addObserver:self forKeyPath:@"visible" options:0 context:(__bridge void *)TrayID];
+    static NSHashTable *watched;
+    if (!watched) watched = [NSHashTable weakObjectsHashTable];
+    for (NSTouchBar *bar in bars) {
+        if ([watched containsObject:bar]) continue;
+        [watched addObject:bar];
+        [bar addObserver:self forKeyPath:@"visible" options:0 context:(__bridge void *)TrayID];
+    }
+}
+
+// Secondary pages are built the first time they are opened: most sessions never open
+// most of them, and each holds a handful of views and symbol images.
+- (void)ensureSliderPages {
+    if (self.touchBarPage) return;
+    NSSlider *slider;
+    NSCustomTouchBarItem *touchBarItem = [self slider:&slider width:320 min:@"sun.min" max:@"sun.max.fill" label:@"Touch Bar Brightness" action:@selector(touchBarSliderMoved:)];
+    self.touchBarSlider = slider;
+    NSCustomTouchBarItem *keyboardItem = [self slider:&slider width:320 min:@"light.min" max:@"light.max" label:@"Keyboard Backlight" action:@selector(keyboardSliderMoved:)];
+    self.keyboardSlider = slider;
+    self.touchBarValue = [self valueLabel];
+    self.keyboardValue = [self valueLabel];
+    self.touchBarPage = [self sliderPage:touchBarItem value:self.touchBarValue];
+    self.keyboardPage = [self sliderPage:keyboardItem value:self.keyboardValue];
+    NSCustomTouchBarItem *monitorItem = [self slider:&slider width:180 min:@"sun.min" max:@"sun.max.fill" label:@"Monitor Brightness" action:@selector(monitorSliderMoved:)];
+    self.monitorSlider = slider;
+    self.monitorValue = [self valueLabel];
+    self.monitorPage = [NSTouchBar new];
+    self.monitorPage.templateItems = [NSSet setWithArray:@[
+        [self item:@"back" view:[self barButton:@"chevron.left" fallback:nil title:nil action:@selector(showMainPage:)] label:@"Back"],
+        monitorItem,
+        [self item:@"value" view:self.monitorValue label:@"Level"],
+        [self item:@"sleep" view:[self fixedWidth:96 button:[self barButton:@"zzz" fallback:@"powersleep" title:@"Sleep" action:@selector(sleepDisplays:)]] label:@"Sleep Display"],
+        [self item:@"modes" view:[self fixedWidth:100 button:[self barButton:@"rectangle.expand.vertical" fallback:@"aspectratio" title:@"Modes" action:@selector(showDisplayPage:)]] label:@"Resolution"],
+    ]];
+    self.monitorPage.defaultItemIdentifiers = @[@"back", @"slider", @"value", NSTouchBarItemIdentifierFixedSpaceSmall, @"sleep", @"modes"];
+    [self watchVisibility:@[self.touchBarPage, self.keyboardPage, self.monitorPage]];
+}
+
+- (void)ensureDisplayPage {
+    if (self.displayBar) return;
+    self.headlessButton = [self barButton:@"laptopcomputer" fallback:nil title:@"Built-in Off" action:@selector(toggleHeadless:)];
+    NSScrubberFlowLayout *layout = [NSScrubberFlowLayout new];
+    layout.itemSpacing = 6;
+    self.modeScrubber = [[NSScrubber alloc] initWithFrame:NSMakeRect(0, 0, 320, 30)];
+    self.modeScrubber.scrubberLayout = layout;
+    self.modeScrubber.mode = NSScrubberModeFree;
+    self.modeScrubber.selectionBackgroundStyle = NSScrubberSelectionStyle.roundedBackgroundStyle;
+    self.modeScrubber.showsAdditionalContentIndicators = YES;
+    self.modeScrubber.dataSource = self;
+    self.modeScrubber.delegate = self;
+    [self.modeScrubber registerClass:NSScrubberTextItemView.class forItemIdentifier:@"mode"];
+    [self.modeScrubber.widthAnchor constraintEqualToConstant:320].active = YES;
+    NSArray *displayItems = @[
+        [self item:@"back" view:[self barButton:@"chevron.left" fallback:nil title:nil action:@selector(showMonitorPage:)] label:@"Back"],
+        [self item:@"headless" view:self.headlessButton label:@"Built-in Display"],
+        [self item:@"redetect" view:[self barButton:@"arrow.clockwise" fallback:nil title:nil action:@selector(reapply:)] label:@"Re-detect Displays"],
+        [self item:@"modes" view:self.modeScrubber label:@"Resolution"],
+    ];
+    self.displayBar = [NSTouchBar new];
+    self.displayBar.templateItems = [NSSet setWithArray:displayItems];
+    self.displayBar.defaultItemIdentifiers = @[@"back", @"headless", @"redetect", NSTouchBarItemIdentifierFixedSpaceSmall, @"modes"];
+
+    [self watchVisibility:@[self.displayBar]];
+}
+
+- (NSArray<NSTouchBar *> *)builtBars {
+    NSMutableArray *bars = [NSMutableArray array];
+    for (NSTouchBar *bar in @[self.mainBar ?: NSNull.null, self.statsBar ?: NSNull.null, self.touchBarPage ?: NSNull.null,
+                              self.keyboardPage ?: NSNull.null, self.monitorPage ?: NSNull.null, self.displayBar ?: NSNull.null,
+                              self.fanPage ?: NSNull.null, self.fanCustomPage ?: NSNull.null])
+        if ([bar isKindOfClass:NSTouchBar.class]) [bars addObject:bar];
+    return bars;
 }
 
 - (void)present:(NSTouchBar *)bar {
@@ -1300,11 +1479,12 @@ static BOOL ShowsStats(NSString *bundleID) {
 
 - (void)showControls:(id)sender { [self refreshControls]; [self present:self.mainBar]; }
 - (void)showMainPage:(id)sender { [self showControls:sender]; }
-- (void)showTouchBarPage:(id)sender { [self refreshControls]; [self present:self.touchBarPage]; }
-- (void)showKeyboardPage:(id)sender { [self refreshControls]; [self present:self.keyboardPage]; }
-- (void)showMonitorPage:(id)sender { [self refreshControls]; [self present:self.monitorPage]; }
+- (void)showTouchBarPage:(id)sender { [self ensureSliderPages]; [self refreshControls]; [self present:self.touchBarPage]; }
+- (void)showKeyboardPage:(id)sender { [self ensureSliderPages]; [self refreshControls]; [self present:self.keyboardPage]; }
+- (void)showMonitorPage:(id)sender { [self ensureSliderPages]; [self refreshControls]; [self present:self.monitorPage]; }
 - (void)showDisplayPage:(id)sender {
-    [self reloadModes];
+    [self ensureDisplayPage];
+    [self refreshControls];
     [self present:self.displayBar];
 }
 
@@ -1473,7 +1653,7 @@ static BOOL ShowsStats(NSString *bundleID) {
 - (void)dismissBar {
     if ([NSTouchBar respondsToSelector:@selector(dismissSystemModalTouchBar:)]) {
         [NSTouchBar dismissSystemModalTouchBar:self.mainBar];
-        for (NSTouchBar *bar in @[self.displayBar, self.touchBarPage, self.keyboardPage, self.monitorPage, self.fanPage, self.fanCustomPage]) [NSTouchBar dismissSystemModalTouchBar:bar];
+        for (NSTouchBar *bar in self.builtBars) if (bar != self.statsBar) [NSTouchBar dismissSystemModalTouchBar:bar];
         self.presentedBar = nil;
     }
 }
@@ -1825,7 +2005,7 @@ static int RunCLI(int argc, const char **argv) {
         printf("mouse scroll  %s\n", !SettingBool(@"ReverseMouseScroll", NO) ? "natural (system setting)"
                : AXIsProcessTrusted() ? "reversed (see 'Reverse Mouse Scrolling' in the menu if it has no effect)"
                : "reversed - needs Accessibility permission for Headless");
-        printf("temperature   %.0f°C (SoC, %lu sensors)\n", SocTemperature(), (unsigned long)SocSensors().count);
+        printf("temperature   %.0f°C (SoC, %lu sensors)\n", SocTemperature(), (unsigned long)SocSensorCount());
         printf("fan speed     %.0f rpm\n", FanRPM());
         NSDictionary *fans = FanRequest(@"status");
         printf("fans          %s%s\n", fans ? [FanModeTitle(fans[@"mode"]) stringByAppendingString:@", "].UTF8String : "", FanSummary(fans).UTF8String);

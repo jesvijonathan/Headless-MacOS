@@ -141,6 +141,23 @@ fan daemon is [`Sources/fand`](Sources/fand), Swift, and its SMC access comes fr
   ControlStrip relaunches (seen through KVO on `NSWorkspace.runningApplications`).
 - A 15-minute timer with a 2-minute tolerance is the only periodic work, as a safety net.
 
+### Performance
+
+Measured on an M1 MacBook Pro running macOS 27:
+
+| | agent (`Headless`) | fan daemon |
+|---|---|---|
+| Memory (footprint) | ~19 MB (an empty menu-bar app is ~11 MB) | ~9 MB |
+| CPU when idle | 0.00 s per minute: no timers, only events | 0 in Auto; one SMC pass every 3–6 s in Smart |
+| CPU with the stats bar showing | ~0.5% (one 2 s tick: a few syscalls, ≤9 SMC reads, a partial redraw) | — |
+
+How it gets there:
+- Secondary Touch Bar pages are built on first use.
+- The stats row is a single view that redraws only the values that changed.
+- Sensors are read from a hot set of the 8 hottest, rescanned every minute, and SMC key info is cached.
+- The GPU service handle is kept, and network and battery are only read when shown.
+- Binaries are built with LTO and dead-code stripping, and their symbols are stripped.
+
 Logs: `log stream --predicate 'subsystem == "dev.jesvi.headless"'`
 
 ## License

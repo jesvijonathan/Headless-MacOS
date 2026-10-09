@@ -1,8 +1,8 @@
 // headless-fand — root fan daemon for Headless.
 //
 // Modes:  auto    macOS controls the fans (default)
-//         smart   temperature curve: minimum RPM below `low` °C (60), maximum at `high` °C (90),
-//                 using the mean of the 4 hottest SoC sensors
+//         smart   temperature curve (Curve.swift): minimum RPM below `low` °C (60), easing up
+//                 to maximum at `high` °C (90), from the mean of the 4 hottest SoC sensors
 //         custom  fixed RPM
 //         max     full blast
 //
@@ -85,8 +85,8 @@ func save() {
     if let data = try? PropertyListEncoder().encode(state) { FileManager.default.createFile(atPath: statePath, contents: data) }
 }
 
-var smoothedTemp: Double?
-var lastTargets: [Int: Double] = [:]
+var temperature = TemperatureFilter()
+var smartTargets: [Int: SmartFanTarget] = [:]   // per fan id; see Curve.swift
 var timer: DispatchSourceTimer?
 var interval = 3.0
 var stableTicks = 0
@@ -107,42 +107,43 @@ func handBack() {
         smc.setFanMode(fan.id, mode: .automatic)
     }
     _ = smc.resetFanControl()
-    lastTargets.removeAll()
-}
-
-func target(for fan: Fan) -> Double {
-    if thermalEmergency || state.mode == "max" { return fan.max }
-    if state.mode == "custom" { return Swift.min(fan.max, Swift.max(fan.min, state.custom)) }
-    // smart: linear between low and high, smoothed, and slow to spin down
-    guard let t = smoothedTemp else { return fan.max }
-    let fraction = Swift.min(1, Swift.max(0, (t - state.low) / Swift.max(1, state.high - state.low)))
-    var rpm = (fan.min + (fan.max - fan.min) * fraction).rounded()
-    if let last = lastTargets[fan.id] {
-        if abs(rpm - last) < 150 { rpm = last }            // ignore jitter
-        else if rpm < last { rpm = Swift.max(rpm, last - 300) }  // ramp down gently
-    }
-    return rpm
+    smartTargets.removeAll()
 }
 
 func tick() {
     if state.mode == "auto" && !thermalEmergency { return }
-    if state.mode == "smart", let t = hottest() {
-        let previous = smoothedTemp
-        smoothedTemp = previous.map { $0 * 0.6 + t * 0.4 } ?? t
-        // Follow the temperature every 3 s while it moves; every 6 s once it has settled.
-        stableTicks = previous.map { abs($0 - smoothedTemp!) < 0.5 } == true ? stableTicks + 1 : 0
-        let wanted: Double = stableTicks >= 5 ? 6 : 3
-        if wanted != interval {
-            interval = wanted
-            timer?.schedule(deadline: .now() + wanted, repeating: wanted, leeway: .seconds(1))
+    let curve = SmartCurve(low: state.low, high: state.high)
+    let previous = temperature.value
+    let current = state.mode == "smart" ? temperature.add(hottest()) : nil
+    var settled = true
+    for fan in fans {
+        let rpm: Double
+        if thermalEmergency || state.mode == "max" {
+            rpm = fan.max
+        } else if state.mode == "custom" {
+            rpm = Swift.min(fan.max, Swift.max(fan.min, state.custom))
+        } else {
+            var smart = smartTargets[fan.id] ?? SmartFanTarget(minRPM: fan.min, maxRPM: fan.max)
+            rpm = smart.next(temperature: current, curve: curve)   // nil temperature → maximum
+            if let current { settled = settled && smart.settled(temperature: current, curve: curve) }
+            smartTargets[fan.id] = smart
+        }
+        let target = smc.getValue(smc.fanModeKey(fan.id)) == 1 ? smc.getValue("F\(fan.id)Tg") : nil
+        if target == rpm { continue }
+        if !smc.applyFanTarget(fan.id, Int(rpm)) {
+            smartTargets[fan.id]?.reset()  // retry from scratch next tick
+            log.error("Fan \(fan.id): could not apply \(Int(rpm)) RPM")
         }
     }
-    for fan in fans {
-        let rpm = target(for: fan)
-        let current = smc.getValue(smc.fanModeKey(fan.id)) == 1 ? smc.getValue("F\(fan.id)Tg") : nil
-        if current == rpm { continue }
-        if smc.applyFanTarget(fan.id, Int(rpm)) { lastTargets[fan.id] = rpm }
-        else { log.error("Fan \(fan.id): could not apply \(Int(rpm)) RPM") }
+    // Smart: check every 3 s while the temperature moves or a ramp is in progress; every 6 s
+    // once both have settled.
+    guard state.mode == "smart" else { return }
+    let steady = settled && previous != nil && current != nil && abs(previous! - current!) < 0.5
+    stableTicks = steady ? stableTicks + 1 : 0
+    let wanted: Double = stableTicks >= 5 ? 6 : 3
+    if wanted != interval {
+        interval = wanted
+        timer?.schedule(deadline: .now() + wanted, repeating: wanted, leeway: .seconds(1))
     }
 }
 
@@ -214,7 +215,7 @@ func handle(_ line: String, uid: uid_t) -> String {
         return #"{"error":"unknown request"}"#
     }
     save()
-    lastTargets.removeAll()
+    smartTargets.removeAll()
     log.info("Fan mode \(state.mode, privacy: .public) (uid \(uid))")
     reschedule()
     return status()
@@ -288,7 +289,7 @@ powerPort = IORegisterForSystemPower(nil, &notifyPort, { _, _, type, argument in
     if type == kIOMessageCanSystemSleep || type == kIOMessageSystemWillSleep {
         IOAllowPowerChange(powerPort, Int(bitPattern: argument))
     } else if type == kIOMessageSystemHasPoweredOn {
-        queue.asyncAfter(deadline: .now() + 2) { lastTargets.removeAll(); reschedule() }
+        queue.asyncAfter(deadline: .now() + 2) { smartTargets.removeAll(); reschedule() }
     }
 }, &notifier)
 if let notifyPort { IONotificationPortSetDispatchQueue(notifyPort, queue) }

@@ -28,7 +28,7 @@ ControlStrip restarts and Touch Bar power events, and idles at 0% CPU.
 | **Monitor brightness** | Software dimming (gamma) for monitors without DDC, with a 12% floor so your only screen never goes black. Apple's Control Strip brightness button and the brightness keys drive it too. |
 | **Desktop stats** | When Finder or the screensaver is frontmost, the Touch Bar shows time · CPU · GPU · memory (GB and %) · temperature · fan RPM · network (or battery when unplugged/charging). Switching to any app gives the Touch Bar back. Tap the clock for the controls. |
 | **Display modes** | Resolution and refresh-rate switching, including HiDPI modes. |
-| **Fan control** | Auto (macOS), Smart (temperature curve, 60–90 °C by default), Custom RPM, or Max. Runs from boot as a small root daemon. |
+| **Fan control** | Auto (macOS), Smart, Custom RPM, or Max. Runs from boot as a small root daemon. Smart eases from minimum at 60 °C to maximum at 90 °C (≈1370 RPM at 65 °C, 2700 at 75 °C, 5370 at 85 °C on an M1 13"): it reacts fast to heat, cools down gently, ignores jitter, and goes to maximum if the sensors fail. |
 | **Mouse scroll direction** | Reverses wheel-mouse scrolling while the trackpad keeps natural scrolling, replacing tools like Scroll Reverser. Needs Accessibility permission. |
 | **Keep awake** | Prevents system sleep on AC power (like `caffeinate -s`); displays may still sleep. |
 | **Night Shift, Sleep display, Lock** | One tap or one shortcut. |
@@ -92,7 +92,7 @@ To carry your levels, toggles and fan mode over, run `make save-config` on the o
 commit `config/`. `make install` restores them, but only on a machine that has no settings
 yet, so it never overwrites live ones.
 
-Try it without installing: `make run`. Remove it with `make uninstall`. Your settings in
+Try it without installing: `make run`. Run the Smart fan-mode tests: `make test`. Remove it with `make uninstall`. Your settings in
 `~/Library/Application Support/Headless/settings.plist` are kept.
 
 The LaunchAgent (`/Library/LaunchAgents/dev.jesvi.headless.plist`) loads in both the

@@ -1276,6 +1276,8 @@ static NSString *UptimeText(void) {
 - (void)sleepDisplay:(NSButton *)sender { SleepDisplays(); }
 @end
 
+static BOOL gScreenLocked;
+
 static void StartLoginPanel(void) {
     if (SettingBool(@"LockScreenPanel", YES)) [HKStatusPanel.shared show];
 }
@@ -1341,9 +1343,9 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
         [workspace addObserver:self selector:@selector(woke:) name:name object:nil];
     [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(woke:) name:@"com.apple.screenIsUnlocked" object:nil];
     [NSDistributedNotificationCenter.defaultCenter addObserverForName:@"com.apple.screenIsLocked" object:nil queue:NSOperationQueue.mainQueue
-                                                           usingBlock:^(NSNotification *n) { if (SettingBool(@"LockScreenPanel", YES)) [HKStatusPanel.shared show]; }];
+                                                           usingBlock:^(NSNotification *n) { gScreenLocked = YES; if (SettingBool(@"LockScreenPanel", YES)) [HKStatusPanel.shared show]; }];
     [NSDistributedNotificationCenter.defaultCenter addObserverForName:@"com.apple.screenIsUnlocked" object:nil queue:NSOperationQueue.mainQueue
-                                                           usingBlock:^(NSNotification *n) { [HKStatusPanel.shared hide]; }];
+                                                           usingBlock:^(NSNotification *n) { gScreenLocked = NO; [HKStatusPanel.shared hide]; }];
     // Fires on every app launch/quit; used to notice ControlStrip restarting.
     [NSWorkspace.sharedWorkspace addObserver:self forKeyPath:@"runningApplications" options:0 context:NULL];
 
@@ -1767,7 +1769,7 @@ static BOOL ShowsStats(NSString *bundleID) {
     [HKStatusPanel.shared show];  // hides itself after 15 s
     static uint64_t generation;
     uint64_t mine = ++generation;
-    After(15, ^{ if (mine == generation) [HKStatusPanel.shared hide]; });
+    After(15, ^{ if (mine == generation && !gScreenLocked) [HKStatusPanel.shared hide]; });  // locked meanwhile: it stays
 }
 
 - (void)showFanPage:(id)sender {

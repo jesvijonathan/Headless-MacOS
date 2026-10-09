@@ -48,6 +48,10 @@ full-width page. Tap the end icons for ±10%.
 ![Display modes page](docs/touchbar-display.png)
 ![Fans page](docs/touchbar-fans.png)
 
+### Lock and login screen
+
+![Lock screen panel](docs/lock-panel.png)
+
 ### Shortcuts (⌃⌥⌘ +)
 
 | key | action | key | action |

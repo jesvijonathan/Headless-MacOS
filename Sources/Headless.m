@@ -5,6 +5,7 @@
 //   • fan modes (auto / smart curve / custom RPM / max) via the root headless-fand daemon
 //   • live CPU / memory / temperature / fan / battery stats on the Touch Bar at the desktop
 //   • reversed scroll direction for wheel mice, leaving trackpad natural scrolling alone
+//   • a status panel on the login and lock screens (the Touch Bar belongs to loginwindow there)
 //   • external monitor brightness (software dimming), resolution / refresh
 //     rate, Night Shift, keep-awake, lock and display sleep, from the Control
 //     Strip, menu bar, global shortcuts (⌃⌥⌘) and a small CLI
@@ -29,6 +30,7 @@
 #import <os/log.h>
 #import <sys/socket.h>
 #import <sys/un.h>
+#import <sys/stat.h>
 #import <ifaddrs.h>
 #import <net/if.h>
 
@@ -81,8 +83,15 @@ static double SettingLevel(NSString *key, double fallback) {
 
 static BOOL SaveSettingsNow(void) {
     NSString *path = SettingsPath();
-    [NSFileManager.defaultManager createDirectoryAtPath:path.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:NULL];
-    return [gSettings writeToFile:path atomically:YES];
+    NSString *folder = path.stringByDeletingLastPathComponent;
+    [NSFileManager.defaultManager createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:NULL];
+    // The login-window copy runs as root: keep the file owned by whoever owns the folder (the
+    // user), or their own session could no longer save settings.
+    struct stat owner;
+    BOOL keepOwner = getuid() == 0 && stat(folder.fileSystemRepresentation, &owner) == 0;
+    BOOL ok = [gSettings writeToFile:path atomically:YES];
+    if (ok && keepOwner) chown(path.fileSystemRepresentation, owner.st_uid, owner.st_gid);
+    return ok;
 }
 
 // Sliders fire continuously; write once they settle.
@@ -767,6 +776,8 @@ static BOOL SessionLoggedIn(void) {
     return [session[(__bridge NSString *)kCGSessionLoginDoneKey] boolValue];
 }
 
+static void StartLoginPanel(void);
+
 static int RunPreLogin(void) {
     os_log(HKLog, "Starting in login-window mode (uid %d)", getuid());
     CGDisplayRegisterReconfigurationCallback(DisplaysReconfigured, NULL);
@@ -792,7 +803,11 @@ static int RunPreLogin(void) {
         });
         dispatch_resume(timer);
     }
-    CFRunLoopRun();
+    // A minimal AppKit app, only for the on-screen status panel (no menu bar, no Touch Bar).
+    NSApplication *app = NSApplication.sharedApplication;
+    app.activationPolicy = NSApplicationActivationPolicyProhibited;
+    StartLoginPanel();
+    [app run];
     return 0;
 }
 
@@ -817,24 +832,50 @@ static NSImage *Symbol(NSString *name, NSString *fallback) {
     NSMutableDictionary<NSString *, NSString *> *_texts;
     NSMutableDictionary<NSString *, NSImage *> *_icons;
     NSDictionary *_textAttributes, *_clockAttributes;
+    NSMutableDictionary<NSString *, NSNumber *> *_widths;
 }
 
-static const CGFloat StatsGap = 6;
+// The Touch Bar drops an item that doesn't fit beside the close button, so the row stays within
+// this width: the leftover space is shared out as equal gaps between segments.
+static const CGFloat StatsWidth = 604;
 
-static NSDictionary<NSString *, NSArray *> *StatSegments(void) {  // key → @[default symbol, width]
+// key → @[default symbol, shortest text]. Each segment is as wide as its icon plus the widest
+// text it has shown since the row appeared, so the gaps stay even and the row only shifts when
+// a value gains a digit, never back and forth.
+static NSDictionary<NSString *, NSArray *> *StatSegments(void) {
     static NSDictionary *segments;
     if (!segments) segments = @{
-        @"clock": @[@"", @100], @"cpu": @[@"cpu", @56], @"gpu": @[@"cube.transparent", @54],
-        @"memory": @[@"memorychip", @94], @"temp": @[@"thermometer.medium", @50], @"fan": @[@"fan.fill", @62],
-        @"network": @[@"", @84], @"battery": @[@"battery.100", @72],
+        @"clock": @[@"", @"–"], @"cpu": @[@"cpu", @"8%"], @"gpu": @[@"cube.transparent", @"8%"],
+        @"memory": @[@"memorychip", @"8.8G | 8%"], @"temp": @[@"thermometer.medium", @"88°"], @"fan": @[@"fan.fill", @"8888"],
+        @"network": @[@"", @"↓8K ↑8B"], @"battery": @[@"battery.100", @"8%"],
     };
     return segments;
+}
+
+- (CGFloat)gap {
+    CGFloat used = 0;
+    for (NSString *key in self.segments) used += [self widthOfSegment:key];
+    NSUInteger gaps = self.segments.count > 1 ? self.segments.count - 1 : 1;
+    return floor(MIN(18, MAX(4, (StatsWidth - used) / gaps)));
+}
+
+- (CGFloat)widthOfSegment:(NSString *)key {
+    NSNumber *cached = _widths[key];
+    if (cached) return cached.doubleValue;
+    NSDictionary *attributes = [key isEqualToString:@"clock"] ? _clockAttributes : _textAttributes;
+    NSString *text = _texts[key];
+    CGFloat width = ceil([StatSegments()[key][1] sizeWithAttributes:attributes].width);
+    if (text) width = MAX(width, ceil([text sizeWithAttributes:attributes].width));
+    if (_icons[key]) width += ceil(_icons[key].size.width) + 5;
+    _widths[key] = @(width);
+    return width;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
     if ((self = [super initWithFrame:frame])) {
         _texts = [NSMutableDictionary dictionary];
         _icons = [NSMutableDictionary dictionary];
+        _widths = [NSMutableDictionary dictionary];
         NSColor *white = [NSColor colorWithWhite:1 alpha:0.92];
         _textAttributes = @{NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular], NSForegroundColorAttributeName: white};
         _clockAttributes = @{NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightMedium], NSForegroundColorAttributeName: white};
@@ -845,6 +886,7 @@ static NSDictionary<NSString *, NSArray *> *StatSegments(void) {  // key → @[d
 
 - (void)setSegments:(NSArray<NSString *> *)segments {
     _segments = [segments copy];
+    [_widths removeAllObjects];
     for (NSString *key in segments)
         if (!_icons[key] && [StatSegments()[key][0] length]) [self setSymbol:StatSegments()[key][0] tint:nil forSegment:key];
     [self invalidateIntrinsicContentSize];
@@ -852,17 +894,17 @@ static NSDictionary<NSString *, NSArray *> *StatSegments(void) {  // key → @[d
 }
 
 - (NSSize)intrinsicContentSize {
-    CGFloat width = 0;
-    for (NSString *key in self.segments) width += [StatSegments()[key][1] doubleValue] + StatsGap;
-    return NSMakeSize(width, 30);
+    CGFloat width = 0, gap = self.gap;
+    for (NSString *key in self.segments) width += [self widthOfSegment:key] + gap;
+    return NSMakeSize(MAX(0, width - gap), 30);
 }
 
 - (NSRect)rectForSegment:(NSString *)segment {
-    CGFloat x = 0;
+    CGFloat x = 0, gap = self.gap;
     for (NSString *key in self.segments) {
-        CGFloat width = [StatSegments()[key][1] doubleValue];
+        CGFloat width = [self widthOfSegment:key];
         if ([key isEqualToString:segment]) return NSMakeRect(x, 0, width, NSHeight(self.bounds));
-        x += width + StatsGap;
+        x += width + gap;
     }
     return NSZeroRect;
 }
@@ -870,21 +912,34 @@ static NSDictionary<NSString *, NSArray *> *StatSegments(void) {  // key → @[d
 - (void)setText:(NSString *)text forSegment:(NSString *)segment {
     if ([_texts[segment] isEqualToString:text]) return;
     _texts[segment] = text;
-    [self setNeedsDisplayInRect:[self rectForSegment:segment]];  // repaint just this segment
+    [self segmentChanged:segment];
 }
 
 - (void)setSymbol:(NSString *)symbol tint:(NSColor *)tint forSegment:(NSString *)segment {
     NSImageSymbolConfiguration *config = [[NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular]
         configurationByApplyingConfiguration:[NSImageSymbolConfiguration configurationWithPaletteColors:@[tint ?: [NSColor colorWithWhite:1 alpha:0.92]]]];
     _icons[segment] = [Symbol(symbol, @"circle") imageWithSymbolConfiguration:config];
-    [self setNeedsDisplayInRect:[self rectForSegment:segment]];
+    [self segmentChanged:segment];
+}
+
+- (void)segmentChanged:(NSString *)segment {
+    CGFloat before = _widths[segment].doubleValue;
+    [_widths removeObjectForKey:segment];
+    CGFloat now = [self widthOfSegment:segment];
+    if (now < before) _widths[segment] = @(now = before);  // keep the widest
+    if (before && now != before) {  // wider: the gaps and everything after it move
+        [self invalidateIntrinsicContentSize];
+        self.needsDisplay = YES;
+    } else {
+        [self setNeedsDisplayInRect:[self rectForSegment:segment]];  // repaint just this segment
+    }
 }
 
 - (void)drawRect:(NSRect)dirty {
-    CGFloat x = 0, mid = NSMidY(self.bounds);
+    CGFloat x = 0, gap = self.gap, mid = NSMidY(self.bounds);
     for (NSString *key in self.segments) {
-        CGFloat width = [StatSegments()[key][1] doubleValue], textX = x;
-        if (![self needsToDrawRect:NSMakeRect(x, 0, width + StatsGap, NSHeight(self.bounds))]) { x += width + StatsGap; continue; }
+        CGFloat width = [self widthOfSegment:key], textX = x;
+        if (![self needsToDrawRect:NSMakeRect(x, 0, width + gap, NSHeight(self.bounds))]) { x += width + gap; continue; }
         NSImage *icon = _icons[key];
         if (icon) {
             NSSize size = icon.size;
@@ -898,21 +953,209 @@ static NSDictionary<NSString *, NSArray *> *StatSegments(void) {  // key → @[d
         [text drawAtPoint:NSMakePoint(textX, round(mid - size.height / 2)) withAttributes:attributes];
         if (clock) {  // separator after the clock
             [[NSColor colorWithWhite:1 alpha:0.25] setFill];
-            NSRectFill(NSMakeRect(x + width + StatsGap / 2 - 0.5, mid - 10, 1, 20));
+            NSRectFill(NSMakeRect(x + width + gap / 2 - 0.5, mid - 10, 1, 20));
         }
-        x += width + StatsGap;
+        x += width + gap;
     }
 }
 
 - (void)touchesEndedWithEvent:(NSEvent *)event {
     NSTouch *touch = [[event touchesMatchingPhase:NSTouchPhaseEnded inView:self] anyObject];
-    CGFloat at = [touch locationInView:self].x, x = 0;
+    CGFloat at = [touch locationInView:self].x, x = 0, gap = self.gap;
     for (NSString *key in self.segments) {
-        x += [StatSegments()[key][1] doubleValue] + StatsGap;
+        x += [self widthOfSegment:key] + gap;
         if (at < x) { if (self.tapped) self.tapped(key); return; }
     }
 }
 @end
+
+#pragma mark - Login / lock screen panel
+
+// On the login and lock screens the Touch Bar belongs to loginwindow, so Headless shows a small
+// panel on the screen instead. Ordinary windows sit below those screens; this one is moved into
+// a window-server space at the level macOS uses for notifications over the lock screen.
+typedef int (*SLSMainConnectionIDFn)(void);
+typedef uint64_t (*SLSSpaceCreateFn)(int, int, CFDictionaryRef);
+typedef CGError (*SLSSpaceSetAbsoluteLevelFn)(int, uint64_t, int);
+typedef CGError (*SLSShowSpacesFn)(int, CFArrayRef);
+typedef CGError (*SLSSpaceAddWindowsAndRemoveFromSpacesFn)(int, uint64_t, CFArrayRef, int);
+
+static BOOL RaiseAboveLockScreen(NSWindow *window) {
+    static uint64_t space;
+    static int connection;
+    void *sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY);
+    SLSMainConnectionIDFn mainConnection = sky ? dlsym(sky, "SLSMainConnectionID") : NULL;
+    SLSSpaceCreateFn createSpace = sky ? dlsym(sky, "SLSSpaceCreate") : NULL;
+    SLSSpaceSetAbsoluteLevelFn setLevel = sky ? dlsym(sky, "SLSSpaceSetAbsoluteLevel") : NULL;
+    SLSShowSpacesFn showSpaces = sky ? dlsym(sky, "SLSShowSpaces") : NULL;
+    SLSSpaceAddWindowsAndRemoveFromSpacesFn addWindows = sky ? dlsym(sky, "SLSSpaceAddWindowsAndRemoveFromSpaces") : NULL;
+    if (!mainConnection || !createSpace || !setLevel || !showSpaces || !addWindows) return NO;
+    if (!space) {
+        connection = mainConnection();
+        space = createSpace(connection, 1, NULL);
+        if (!space) return NO;
+        setLevel(connection, space, 400);  // "notification center at screen lock"
+        showSpaces(connection, (__bridge CFArrayRef)@[@(space)]);
+    }
+    addWindows(connection, space, (__bridge CFArrayRef)@[@(window.windowNumber)], 7);
+    return YES;
+}
+
+@interface HKStatusPanel : NSObject
++ (instancetype)shared;
+- (void)show;
+- (void)hide;
+@end
+
+@implementation HKStatusPanel {
+    NSPanel *_panel;
+    NSTextField *_time, *_date, *_stats, *_brightnessValue;
+    NSSlider *_brightness;
+    NSSegmentedControl *_fans;
+    NSTimer *_timer;
+}
+
++ (instancetype)shared {
+    static HKStatusPanel *panel;
+    if (!panel) panel = [HKStatusPanel new];
+    return panel;
+}
+
+- (NSTextField *)label:(CGFloat)size weight:(NSFontWeight)weight alpha:(CGFloat)alpha {
+    NSTextField *label = [NSTextField labelWithString:@""];
+    label.font = [NSFont monospacedDigitSystemFontOfSize:size weight:weight];
+    label.textColor = [NSColor colorWithWhite:1 alpha:alpha];
+    return label;
+}
+
+- (void)build {
+    _panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 440, 168)
+                                        styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+                                          backing:NSBackingStoreBuffered defer:NO];
+    _panel.opaque = NO;
+    _panel.backgroundColor = NSColor.clearColor;
+    _panel.hasShadow = YES;
+    _panel.level = NSScreenSaverWindowLevel;
+    _panel.canBecomeVisibleWithoutLogin = YES;
+    _panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorStationary |
+                                NSWindowCollectionBehaviorIgnoresCycle | NSWindowCollectionBehaviorFullScreenAuxiliary;
+    _panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+
+    NSVisualEffectView *background = [[NSVisualEffectView alloc] initWithFrame:_panel.contentView.bounds];
+    background.material = NSVisualEffectMaterialHUDWindow;
+    background.state = NSVisualEffectStateActive;
+    background.wantsLayer = YES;
+    background.layer.cornerRadius = 18;
+    background.layer.masksToBounds = YES;
+    _panel.contentView = background;
+
+    _time = [self label:30 weight:NSFontWeightLight alpha:1];
+    _date = [self label:13 weight:NSFontWeightRegular alpha:0.7];
+    _stats = [self label:12 weight:NSFontWeightRegular alpha:0.85];
+
+    NSImageView *sun = [NSImageView imageViewWithImage:Symbol(@"sun.max.fill", nil)];
+    sun.contentTintColor = [NSColor colorWithWhite:1 alpha:0.8];
+    _brightness = [NSSlider sliderWithValue:100 minValue:0 maxValue:100 target:self action:@selector(brightnessMoved:)];
+    _brightness.continuous = YES;
+    [_brightness.widthAnchor constraintEqualToConstant:250].active = YES;
+    _brightnessValue = [self label:12 weight:NSFontWeightRegular alpha:0.8];
+    [_brightnessValue.widthAnchor constraintEqualToConstant:40].active = YES;
+    NSStackView *brightnessRow = [NSStackView stackViewWithViews:@[sun, _brightness, _brightnessValue]];
+    brightnessRow.spacing = 8;
+
+    NSImageView *fan = [NSImageView imageViewWithImage:Symbol(@"fan.fill", nil)];
+    fan.contentTintColor = [NSColor colorWithWhite:1 alpha:0.8];
+    _fans = [NSSegmentedControl segmentedControlWithLabels:@[@"Auto", @"Smart", @"Max"]
+                                              trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(fanModeChosen:)];
+    NSStackView *fanRow = [NSStackView stackViewWithViews:@[fan, _fans]];
+    fanRow.spacing = 8;
+
+    NSStackView *timeRow = [NSStackView stackViewWithViews:@[_time, _date]];
+    timeRow.alignment = NSLayoutAttributeLastBaseline;
+    timeRow.spacing = 10;
+    NSStackView *stack = [NSStackView stackViewWithViews:@[timeRow, _stats, brightnessRow, fanRow]];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeLeading;
+    stack.spacing = 8;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [background addSubview:stack];
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.leadingAnchor constraintEqualToAnchor:background.leadingAnchor constant:20],
+        [stack.trailingAnchor constraintLessThanOrEqualToAnchor:background.trailingAnchor constant:-20],
+        [stack.centerYAnchor constraintEqualToAnchor:background.centerYAnchor],
+    ]];
+}
+
+- (void)show {
+    if (!_panel) [self build];
+    NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
+    NSRect frame = screen.frame;
+    [_panel setFrameOrigin:NSMakePoint(NSMinX(frame) + 36, NSMinY(frame) + 36)];
+    CPUUsage();  // prime the delta
+    [self update];
+    [_panel orderFrontRegardless];
+    if (!RaiseAboveLockScreen(_panel)) os_log_error(HKLog, "Could not raise the status panel above the lock screen");
+    [_timer invalidate];
+    _timer = [NSTimer scheduledTimerWithTimeInterval:2 repeats:YES block:^(NSTimer *t) { [self update]; }];
+    _timer.tolerance = 0.5;
+}
+
+- (void)hide {
+    [_timer invalidate];
+    _timer = nil;
+    [_panel orderOut:nil];
+}
+
+- (void)update {
+    static NSDateFormatter *time, *date;
+    if (!time) {
+        time = [NSDateFormatter new];
+        [time setLocalizedDateFormatFromTemplate:@"jmm"];
+        date = [NSDateFormatter new];
+        [date setLocalizedDateFormatFromTemplate:@"EEEEdMMMM"];
+    }
+    NSDate *now = [NSDate date];
+    _time.stringValue = [time stringFromDate:now];
+    _date.stringValue = [date stringFromDate:now];
+
+    double cpu = CPUUsage(), gpu = GPUUsage(), memory = MemoryUsage(), temperature = SocTemperature(), rpm = FanRPM();
+    NSMutableArray *parts = [NSMutableArray array];
+    if (isfinite(cpu)) [parts addObject:[NSString stringWithFormat:@"CPU %.0f%%", cpu * 100]];
+    if (isfinite(gpu)) [parts addObject:[NSString stringWithFormat:@"GPU %.0f%%", gpu * 100]];
+    if (isfinite(memory)) [parts addObject:[NSString stringWithFormat:@"Mem %.1fG", memory * NSProcessInfo.processInfo.physicalMemory / 1073741824.0]];
+    if (isfinite(temperature)) [parts addObject:[NSString stringWithFormat:@"%.0f°C", temperature]];
+    if (isfinite(rpm)) [parts addObject:[NSString stringWithFormat:@"%.0f rpm", rpm]];
+    NSString *symbol;
+    NSString *battery = BatteryText(&symbol);
+    if (battery) [parts addObject:[NSString stringWithFormat:@"%@ %@", [symbol hasPrefix:@"powerplug"] ? @"AC" : [symbol containsString:@"bolt"] ? @"⚡" : @"Bat", battery]];
+    _stats.stringValue = [parts componentsJoinedByString:@"   "];
+
+    double level = SettingLevel(@"MonitorLevel", 1.0);
+    if (!_brightness.highlighted) _brightness.doubleValue = round(level * 100);
+    _brightnessValue.stringValue = [NSString stringWithFormat:@"%.0f%%", round(level * 100)];
+    FanRequestAsync(@"status", ^(NSDictionary *status) {
+        NSUInteger index = [@[@"auto", @"smart", @"max"] indexOfObject:status[@"mode"] ?: @""];
+        self->_fans.enabled = status != nil;
+        self->_fans.selectedSegment = index == NSNotFound ? -1 : (NSInteger)index;
+    });
+}
+
+- (void)brightnessMoved:(NSSlider *)slider {
+    double level = round(slider.doubleValue) / 100;
+    SetSetting(@"MonitorLevel", @(level));
+    ApplyMonitor();
+    _brightnessValue.stringValue = [NSString stringWithFormat:@"%.0f%%", level * 100];
+}
+
+- (void)fanModeChosen:(NSSegmentedControl *)control {
+    NSString *mode = @[@"auto", @"smart", @"max"][(NSUInteger)control.selectedSegment];
+    FanRequestAsync([@"set " stringByAppendingString:mode], ^(NSDictionary *reply) { [self update]; });
+}
+@end
+
+static void StartLoginPanel(void) {
+    [HKStatusPanel.shared show];
+}
 
 typedef NS_ENUM(UInt32, HKHotKey) {
     HKTouchBarUp = 1, HKTouchBarDown, HKKeyboardUp, HKKeyboardDown,
@@ -974,12 +1217,20 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     for (NSString *name in @[NSWorkspaceScreensDidWakeNotification, NSWorkspaceSessionDidBecomeActiveNotification])
         [workspace addObserver:self selector:@selector(woke:) name:name object:nil];
     [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(woke:) name:@"com.apple.screenIsUnlocked" object:nil];
+    [NSDistributedNotificationCenter.defaultCenter addObserverForName:@"com.apple.screenIsLocked" object:nil queue:NSOperationQueue.mainQueue
+                                                           usingBlock:^(NSNotification *n) { if (SettingBool(@"LockScreenPanel", YES)) [HKStatusPanel.shared show]; }];
+    [NSDistributedNotificationCenter.defaultCenter addObserverForName:@"com.apple.screenIsUnlocked" object:nil queue:NSOperationQueue.mainQueue
+                                                           usingBlock:^(NSNotification *n) { [HKStatusPanel.shared hide]; }];
     // Fires on every app launch/quit; used to notice ControlStrip restarting.
     [NSWorkspace.sharedWorkspace addObserver:self forKeyPath:@"runningApplications" options:0 context:NULL];
 
     int token;
     notify_register_dispatch(HKChangedNotify, &token, dispatch_get_main_queue(), ^(int t) { SettingsChangedElsewhere(); UpdateScrollReversal(YES); [weakSelf refreshControls]; });
     notify_register_dispatch(HKShowNotify, &token, dispatch_get_main_queue(), ^(int t) { [weakSelf showControls:nil]; });
+    notify_register_dispatch(HKShowNotify ".panel", &token, dispatch_get_main_queue(), ^(int t) {
+        [HKStatusPanel.shared show];  // preview; hides itself after 15 s
+        After(15, ^{ [HKStatusPanel.shared hide]; });
+    });
     for (NSString *page in @[@"display", @"touchbar", @"keyboard", @"monitor", @"fans", @"stats"]) {
         SEL action = [page isEqualToString:@"stats"] ? @selector(showStats:) : NSSelectorFromString([NSString stringWithFormat:@"show%@Page:", [page isEqualToString:@"touchbar"] ? @"TouchBar" : [page isEqualToString:@"fans"] ? @"Fan" : page.capitalizedString]);
         notify_register_dispatch([@HKShowNotify "." stringByAppendingString:page].UTF8String, &token, dispatch_get_main_queue(), ^(int t) {
@@ -2029,7 +2280,7 @@ static int Usage(void) {
         "  fan curve <low°C> <high°C>  smart-mode curve (default 60 90)\n"
         "  modes                       list modes for the external display\n"
         "  mode <index>                switch to a mode from `modes`\n"
-        "  lock | sleep-display | show [touchbar|keyboard|monitor|display|fans|stats]\n");
+        "  lock | sleep-display | show [touchbar|keyboard|monitor|display|fans|stats|panel]\n");
     return 2;
 }
 

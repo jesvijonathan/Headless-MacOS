@@ -32,6 +32,7 @@ ControlStrip restarts and Touch Bar power events, and idles at 0% CPU.
 | **Mouse scroll direction** | Reverses wheel-mouse scrolling while the trackpad keeps natural scrolling, replacing tools like Scroll Reverser. Needs Accessibility permission. |
 | **Keep awake** | Prevents system sleep on AC power (like `caffeinate -s`); displays may still sleep. |
 | **Night Shift, Sleep display, Lock** | One tap or one shortcut. |
+| **Lock & login screen panel** | macOS keeps the Touch Bar to itself there, so an on-screen panel (bottom-left) takes its place: clock, all the stats, monitor / Touch Bar / keyboard brightness, fan mode, Night Shift, Keep Awake and Sleep Display. Turn it off with "Controls Panel on Lock & Login Screen" in the menu or `Headless lockpanel off`. |
 | **From boot** | Runs in the login-window session too, so the display, brightness and awake state are applied before you sign in. |
 
 ### Touch Bar
@@ -63,10 +64,10 @@ full-width page. Tap the end icons for ±10%.
 H=/Applications/Headless.app/Contents/MacOS/Headless
 $H status                      # displays, levels, toggles
 $H touchbar 70 | keyboard 40 | monitor 60
-$H headless on|off | awake on|off | nightshift toggle | mousescroll reverse|natural
+$H headless on|off | awake on|off | nightshift toggle | mousescroll reverse|natural | lockpanel on|off
 $H modes ; $H mode 3           # list / switch display modes
 $H fan [auto|smart|max|<rpm>]  # fan mode;  $H fan curve 55 85  # smart curve
-$H lock | sleep-display | show [touchbar|keyboard|monitor|display|fans|stats]
+$H lock | sleep-display | show [touchbar|keyboard|monitor|display|fans|stats|panel]
 ```
 
 These work well from Shortcuts.app ("Run Shell Script").
@@ -109,10 +110,9 @@ re-assert every 15 s. Auto does no work at all.
 
 ## Limitations
 
-- **Lock screen and login window UI:** there, macOS hands the Touch Bar to `loginwindow`,
-  which shows only Apple's fixed keys, and global hotkeys are blocked by secure input.
-  Headless keeps enforcing your settings underneath, but its buttons can't appear on those
-  screens.
+- **Lock screen and login window Touch Bar:** there, macOS hands the Touch Bar to `loginwindow`,
+  which shows only Apple's fixed keys, and global hotkeys are blocked by secure input. The
+  on-screen panel covers those screens instead.
 - **Before macOS starts:** the Apple-logo boot screen, FileVault pre-boot unlock and Recovery
   all run before macOS does, so nothing can run there.
 - **Monitor brightness** is software dimming, which reduces contrast at low levels. If your

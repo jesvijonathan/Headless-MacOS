@@ -31,6 +31,7 @@
 #import <sys/socket.h>
 #import <sys/un.h>
 #import <sys/stat.h>
+#import <sys/sysctl.h>
 #import <ifaddrs.h>
 #import <net/if.h>
 
@@ -1009,11 +1010,17 @@ static BOOL RaiseAboveLockScreen(NSWindow *window) {
 
 @implementation HKStatusPanel {
     NSPanel *_panel;
-    NSTextField *_time, *_date, *_stats, *_brightnessValue;
-    NSSlider *_brightness;
+    NSTextField *_time, *_date;
+    NSDictionary<NSString *, NSTextField *> *_stats;
+    NSDictionary<NSString *, NSImageView *> *_statIcons;
+    NSDictionary<NSString *, NSSlider *> *_sliders;
+    NSDictionary<NSString *, NSTextField *> *_sliderValues;
     NSSegmentedControl *_fans;
+    NSButton *_nightShift, *_awake;
     NSTimer *_timer;
 }
+
+static NSArray<NSString *> *PanelFanModes(void) { return @[@"auto", @"smart", @"custom", @"max"]; }
 
 + (instancetype)shared {
     static HKStatusPanel *panel;
@@ -1028,8 +1035,49 @@ static BOOL RaiseAboveLockScreen(NSWindow *window) {
     return label;
 }
 
+- (NSImageView *)icon:(NSString *)symbol {
+    NSImageView *icon = [NSImageView imageViewWithImage:Symbol(symbol, @"circle")];
+    icon.contentTintColor = [NSColor colorWithWhite:1 alpha:0.6];
+    icon.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular];
+    [icon.widthAnchor constraintEqualToConstant:20].active = YES;
+    return icon;
+}
+
+- (NSStackView *)statCell:(NSString *)key symbol:(NSString *)symbol icons:(NSMutableDictionary *)icons labels:(NSMutableDictionary *)labels {
+    NSImageView *icon = [self icon:symbol];
+    NSTextField *value = [self label:13 weight:NSFontWeightRegular alpha:0.92];
+    value.stringValue = @"–";
+    icons[key] = icon;
+    labels[key] = value;
+    NSStackView *cell = [NSStackView stackViewWithViews:@[icon, value]];
+    cell.spacing = 6;
+    return cell;
+}
+
+- (NSArray<NSView *> *)sliderRow:(NSString *)key symbol:(NSString *)symbol title:(NSString *)title
+                         sliders:(NSMutableDictionary *)sliders values:(NSMutableDictionary *)values {
+    NSTextField *name = [self label:12 weight:NSFontWeightRegular alpha:0.7];
+    name.stringValue = title;
+    NSSlider *slider = [NSSlider sliderWithValue:100 minValue:0 maxValue:100 target:self action:@selector(sliderMoved:)];
+    slider.continuous = YES;
+    slider.identifier = key;
+    NSTextField *value = [self label:12 weight:NSFontWeightRegular alpha:0.8];
+    value.alignment = NSTextAlignmentRight;
+    sliders[key] = slider;
+    values[key] = value;
+    return @[[self icon:symbol], name, slider, value];
+}
+
+- (NSButton *)toggle:(NSString *)title symbol:(NSString *)symbol action:(SEL)action {
+    NSButton *button = [NSButton buttonWithTitle:title image:Symbol(symbol, @"circle") target:self action:action];
+    button.imagePosition = NSImageLeading;
+    button.bezelStyle = NSBezelStyleRounded;
+    button.controlSize = NSControlSizeRegular;
+    return button;
+}
+
 - (void)build {
-    _panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 440, 168)
+    _panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 480, 300)
                                         styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
                                           backing:NSBackingStoreBuffered defer:NO];
     _panel.opaque = NO;
@@ -1049,41 +1097,76 @@ static BOOL RaiseAboveLockScreen(NSWindow *window) {
     background.layer.masksToBounds = YES;
     _panel.contentView = background;
 
+    // Clock
     _time = [self label:30 weight:NSFontWeightLight alpha:1];
     _date = [self label:13 weight:NSFontWeightRegular alpha:0.7];
-    _stats = [self label:12 weight:NSFontWeightRegular alpha:0.85];
-
-    NSImageView *sun = [NSImageView imageViewWithImage:Symbol(@"sun.max.fill", nil)];
-    sun.contentTintColor = [NSColor colorWithWhite:1 alpha:0.8];
-    _brightness = [NSSlider sliderWithValue:100 minValue:0 maxValue:100 target:self action:@selector(brightnessMoved:)];
-    _brightness.continuous = YES;
-    [_brightness.widthAnchor constraintEqualToConstant:250].active = YES;
-    _brightnessValue = [self label:12 weight:NSFontWeightRegular alpha:0.8];
-    [_brightnessValue.widthAnchor constraintEqualToConstant:40].active = YES;
-    NSStackView *brightnessRow = [NSStackView stackViewWithViews:@[sun, _brightness, _brightnessValue]];
-    brightnessRow.spacing = 8;
-
-    NSImageView *fan = [NSImageView imageViewWithImage:Symbol(@"fan.fill", nil)];
-    fan.contentTintColor = [NSColor colorWithWhite:1 alpha:0.8];
-    _fans = [NSSegmentedControl segmentedControlWithLabels:@[@"Auto", @"Smart", @"Max"]
-                                              trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(fanModeChosen:)];
-    NSStackView *fanRow = [NSStackView stackViewWithViews:@[fan, _fans]];
-    fanRow.spacing = 8;
-
     NSStackView *timeRow = [NSStackView stackViewWithViews:@[_time, _date]];
     timeRow.alignment = NSLayoutAttributeLastBaseline;
     timeRow.spacing = 10;
-    NSStackView *stack = [NSStackView stackViewWithViews:@[timeRow, _stats, brightnessRow, fanRow]];
+
+    // Stats: two rows of four, in aligned columns
+    NSMutableDictionary *icons = [NSMutableDictionary dictionary], *labels = [NSMutableDictionary dictionary];
+    NSGridView *stats = [NSGridView gridViewWithViews:@[
+        @[[self statCell:@"cpu" symbol:@"cpu" icons:icons labels:labels], [self statCell:@"gpu" symbol:@"cube.transparent" icons:icons labels:labels],
+          [self statCell:@"memory" symbol:@"memorychip" icons:icons labels:labels], [self statCell:@"temp" symbol:@"thermometer.medium" icons:icons labels:labels]],
+        @[[self statCell:@"fan" symbol:@"fan.fill" icons:icons labels:labels], [self statCell:@"network" symbol:@"network" icons:icons labels:labels],
+          [self statCell:@"battery" symbol:@"battery.100" icons:icons labels:labels], [self statCell:@"uptime" symbol:@"clock.arrow.circlepath" icons:icons labels:labels]],
+    ]];
+    stats.columnSpacing = 18;
+    stats.rowSpacing = 8;
+    _stats = labels;
+    _statIcons = icons;
+
+    // Brightness and fans, in aligned columns
+    _fans = [NSSegmentedControl segmentedControlWithLabels:@[@"Auto", @"Smart", @"Custom", @"Max"]
+                                              trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(fanModeChosen:)];
+    _fans.segmentDistribution = NSSegmentDistributionFillEqually;
+    NSTextField *fanName = [self label:12 weight:NSFontWeightRegular alpha:0.7];
+    fanName.stringValue = @"Fans";
+    NSMutableDictionary *sliders = [NSMutableDictionary dictionary], *values = [NSMutableDictionary dictionary];
+    NSGridView *brightness = [NSGridView gridViewWithViews:@[
+        [self sliderRow:@"MonitorLevel" symbol:@"display" title:@"Monitor" sliders:sliders values:values],
+        [self sliderRow:@"TouchBarLevel" symbol:@"sun.max.fill" title:@"Touch Bar" sliders:sliders values:values],
+        [self sliderRow:@"KeyboardLevel" symbol:@"light.max" title:@"Keyboard" sliders:sliders values:values],
+        @[[self icon:@"fan"], fanName, _fans, NSGridCell.emptyContentView],
+    ]];
+    [brightness mergeCellsInHorizontalRange:NSMakeRange(2, 2) verticalRange:NSMakeRange(3, 1)];
+    [brightness rowAtIndex:3].topPadding = 4;
+    [_fans.widthAnchor constraintEqualToConstant:336].active = YES;  // lines up with the end of the percentages
+    brightness.columnSpacing = 8;
+    brightness.rowSpacing = 6;
+    [brightness columnAtIndex:2].width = 300;
+    [brightness columnAtIndex:3].width = 40;
+    brightness.yPlacement = NSGridCellPlacementCenter;
+    _sliders = sliders;
+    _sliderValues = values;
+
+    // Toggles
+    _nightShift = [self toggle:@"Night Shift" symbol:@"moon.fill" action:@selector(toggleNightShift:)];
+    _awake = [self toggle:@"Keep Awake" symbol:@"cup.and.saucer.fill" action:@selector(toggleAwake:)];
+    NSButton *sleep = [self toggle:@"Sleep Display" symbol:@"moon.zzz.fill" action:@selector(sleepDisplay:)];
+    for (NSButton *button in @[_nightShift, _awake]) button.buttonType = NSButtonTypePushOnPushOff;
+    NSStackView *toggles = [NSStackView stackViewWithViews:@[_nightShift, _awake, sleep]];
+    toggles.spacing = 8;
+
+    NSBox *line1 = [NSBox new], *line2 = [NSBox new];
+    line1.boxType = line2.boxType = NSBoxSeparator;
+    NSStackView *stack = [NSStackView stackViewWithViews:@[timeRow, stats, line1, brightness, line2, toggles]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
-    stack.spacing = 8;
+    stack.spacing = 12;
+    stack.edgeInsets = NSEdgeInsetsMake(18, 20, 18, 20);
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     [background addSubview:stack];
     [NSLayoutConstraint activateConstraints:@[
-        [stack.leadingAnchor constraintEqualToAnchor:background.leadingAnchor constant:20],
-        [stack.trailingAnchor constraintLessThanOrEqualToAnchor:background.trailingAnchor constant:-20],
-        [stack.centerYAnchor constraintEqualToAnchor:background.centerYAnchor],
+        [stack.leadingAnchor constraintEqualToAnchor:background.leadingAnchor],
+        [stack.trailingAnchor constraintEqualToAnchor:background.trailingAnchor],
+        [stack.topAnchor constraintEqualToAnchor:background.topAnchor],
+        [stack.bottomAnchor constraintEqualToAnchor:background.bottomAnchor],
+        [line1.widthAnchor constraintEqualToAnchor:stack.widthAnchor constant:-40],
+        [line2.widthAnchor constraintEqualToAnchor:stack.widthAnchor constant:-40],
     ]];
+    [_panel setContentSize:stack.fittingSize];
 }
 
 - (void)show {
@@ -1091,7 +1174,9 @@ static BOOL RaiseAboveLockScreen(NSWindow *window) {
     NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
     NSRect frame = screen.frame;
     [_panel setFrameOrigin:NSMakePoint(NSMinX(frame) + 36, NSMinY(frame) + 36)];
-    CPUUsage();  // prime the delta
+    CPUUsage();  // prime the deltas
+    double down, up;
+    NetworkRates(&down, &up);
     [self update];
     [_panel orderFrontRegardless];
     if (!RaiseAboveLockScreen(_panel)) os_log_error(HKLog, "Could not raise the status panel above the lock screen");
@@ -1106,6 +1191,15 @@ static BOOL RaiseAboveLockScreen(NSWindow *window) {
     [_panel orderOut:nil];
 }
 
+static NSString *UptimeText(void) {
+    struct timeval boot;
+    size_t size = sizeof boot;
+    if (sysctlbyname("kern.boottime", &boot, &size, NULL, 0) != 0) return @"–";
+    long minutes = (long)(time(NULL) - boot.tv_sec) / 60;
+    if (minutes >= 1440) return [NSString stringWithFormat:@"%ldd %ldh", minutes / 1440, minutes / 60 % 24];
+    return [NSString stringWithFormat:@"%ldh %ldm", minutes / 60, minutes % 60];
+}
+
 - (void)update {
     static NSDateFormatter *time, *date;
     if (!time) {
@@ -1118,43 +1212,72 @@ static BOOL RaiseAboveLockScreen(NSWindow *window) {
     _time.stringValue = [time stringFromDate:now];
     _date.stringValue = [date stringFromDate:now];
 
-    double cpu = CPUUsage(), gpu = GPUUsage(), memory = MemoryUsage(), temperature = SocTemperature(), rpm = FanRPM();
-    NSMutableArray *parts = [NSMutableArray array];
-    if (isfinite(cpu)) [parts addObject:[NSString stringWithFormat:@"CPU %.0f%%", cpu * 100]];
-    if (isfinite(gpu)) [parts addObject:[NSString stringWithFormat:@"GPU %.0f%%", gpu * 100]];
-    if (isfinite(memory)) [parts addObject:[NSString stringWithFormat:@"Mem %.1fG", memory * NSProcessInfo.processInfo.physicalMemory / 1073741824.0]];
-    if (isfinite(temperature)) [parts addObject:[NSString stringWithFormat:@"%.0f°C", temperature]];
-    if (isfinite(rpm)) [parts addObject:[NSString stringWithFormat:@"%.0f rpm", rpm]];
-    NSString *symbol;
-    NSString *battery = BatteryText(&symbol);
-    if (battery) [parts addObject:[NSString stringWithFormat:@"%@ %@", [symbol hasPrefix:@"powerplug"] ? @"AC" : [symbol containsString:@"bolt"] ? @"⚡" : @"Bat", battery]];
-    _stats.stringValue = [parts componentsJoinedByString:@"   "];
+    double cpu = CPUUsage(), gpu = GPUUsage(), memory = MemoryUsage(), temperature = SocTemperature(), rpm = FanRPM(), down, up;
+    NetworkRates(&down, &up);
+    _stats[@"cpu"].stringValue = isfinite(cpu) ? [NSString stringWithFormat:@"%.0f%%", cpu * 100] : @"–";
+    _stats[@"gpu"].stringValue = isfinite(gpu) ? [NSString stringWithFormat:@"%.0f%%", gpu * 100] : @"–";
+    _stats[@"memory"].stringValue = isfinite(memory) ? [NSString stringWithFormat:@"%.1fG | %.0f%%", memory * NSProcessInfo.processInfo.physicalMemory / 1073741824.0, memory * 100] : @"–";
+    _stats[@"temp"].stringValue = isfinite(temperature) ? [NSString stringWithFormat:@"%.0f°C", temperature] : @"–";
+    _stats[@"fan"].stringValue = isfinite(rpm) ? [NSString stringWithFormat:@"%.0f rpm", rpm] : @"–";
+    _stats[@"network"].stringValue = [NSString stringWithFormat:@"↓%@ ↑%@", RateText(down), RateText(up)];
+    NSString *symbol = @"battery.100";
+    _stats[@"battery"].stringValue = BatteryText(&symbol) ?: @"–";
+    _statIcons[@"battery"].image = Symbol(symbol, @"battery.100");
+    _stats[@"uptime"].stringValue = UptimeText();
 
-    double level = SettingLevel(@"MonitorLevel", 1.0);
-    if (!_brightness.highlighted) _brightness.doubleValue = round(level * 100);
-    _brightnessValue.stringValue = [NSString stringWithFormat:@"%.0f%%", round(level * 100)];
+    double keyboard = HasSetting(@"KeyboardLevel") ? SettingLevel(@"KeyboardLevel", 1.0) : KeyboardCurrent();
+    NSDictionary *levels = @{@"MonitorLevel": @(SettingLevel(@"MonitorLevel", 1.0)), @"TouchBarLevel": @(SettingLevel(@"TouchBarLevel", 1.0)),
+                             @"KeyboardLevel": @(isfinite(keyboard) ? keyboard : 1.0)};
+    for (NSString *key in levels) {
+        double percent = round([levels[key] doubleValue] * 100);
+        if (!_sliders[key].highlighted) _sliders[key].doubleValue = percent;
+        _sliderValues[key].stringValue = [NSString stringWithFormat:@"%.0f%%", round(_sliders[key].doubleValue)];
+    }
+    _nightShift.state = NightShiftOn();
+    _awake.state = SettingBool(@"KeepAwake", YES);
     FanRequestAsync(@"status", ^(NSDictionary *status) {
-        NSUInteger index = [@[@"auto", @"smart", @"max"] indexOfObject:status[@"mode"] ?: @""];
+        NSUInteger index = [PanelFanModes() indexOfObject:status[@"mode"] ?: @""];
         self->_fans.enabled = status != nil;
         self->_fans.selectedSegment = index == NSNotFound ? -1 : (NSInteger)index;
+        self->_statIcons[@"fan"].contentTintColor = index == NSNotFound || index == 0 ? [NSColor colorWithWhite:1 alpha:0.6] : NSColor.systemBlueColor;
     });
 }
 
-- (void)brightnessMoved:(NSSlider *)slider {
+- (void)sliderMoved:(NSSlider *)slider {
     double level = round(slider.doubleValue) / 100;
-    SetSetting(@"MonitorLevel", @(level));
-    ApplyMonitor();
-    _brightnessValue.stringValue = [NSString stringWithFormat:@"%.0f%%", level * 100];
+    NSString *key = slider.identifier;
+    SetSetting(key, @(level));
+    if ([key isEqualToString:@"MonitorLevel"]) { ApplyMonitor(); SetBuiltinBrightness(level); }
+    else if ([key isEqualToString:@"TouchBarLevel"]) SetTouchBar(level);
+    else SetKeyboard(level);
+    _sliderValues[key].stringValue = [NSString stringWithFormat:@"%.0f%%", level * 100];
 }
 
 - (void)fanModeChosen:(NSSegmentedControl *)control {
-    NSString *mode = @[@"auto", @"smart", @"max"][(NSUInteger)control.selectedSegment];
-    FanRequestAsync([@"set " stringByAppendingString:mode], ^(NSDictionary *reply) { [self update]; });
+    NSString *mode = PanelFanModes()[(NSUInteger)control.selectedSegment];
+    if ([mode isEqualToString:@"custom"]) {  // the last custom speed
+        FanRequestAsync(@"status", ^(NSDictionary *status) {
+            FanRequestAsync([NSString stringWithFormat:@"set custom %.0f", [status[@"custom"] doubleValue]], ^(NSDictionary *reply) { [self update]; });
+        });
+    } else {
+        FanRequestAsync([@"set " stringByAppendingString:mode], ^(NSDictionary *reply) { [self update]; });
+    }
 }
+
+- (void)toggleNightShift:(NSButton *)sender { SetNightShift(!NightShiftOn()); [self update]; }
+
+- (void)toggleAwake:(NSButton *)sender {
+    gSettings[@"KeepAwake"] = @(!SettingBool(@"KeepAwake", YES));
+    SaveSettingsNow();
+    UpdateKeepAwake();
+    [self update];
+}
+
+- (void)sleepDisplay:(NSButton *)sender { SleepDisplays(); }
 @end
 
 static void StartLoginPanel(void) {
-    [HKStatusPanel.shared show];
+    if (SettingBool(@"LockScreenPanel", YES)) [HKStatusPanel.shared show];
 }
 
 typedef NS_ENUM(UInt32, HKHotKey) {
@@ -1228,8 +1351,7 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     notify_register_dispatch(HKChangedNotify, &token, dispatch_get_main_queue(), ^(int t) { SettingsChangedElsewhere(); UpdateScrollReversal(YES); [weakSelf refreshControls]; });
     notify_register_dispatch(HKShowNotify, &token, dispatch_get_main_queue(), ^(int t) { [weakSelf showControls:nil]; });
     notify_register_dispatch(HKShowNotify ".panel", &token, dispatch_get_main_queue(), ^(int t) {
-        [HKStatusPanel.shared show];  // preview; hides itself after 15 s
-        After(15, ^{ [HKStatusPanel.shared hide]; });
+        [weakSelf previewPanel:nil];
     });
     for (NSString *page in @[@"display", @"touchbar", @"keyboard", @"monitor", @"fans", @"stats"]) {
         SEL action = [page isEqualToString:@"stats"] ? @selector(showStats:) : NSSelectorFromString([NSString stringWithFormat:@"show%@Page:", [page isEqualToString:@"touchbar"] ? @"TouchBar" : [page isEqualToString:@"fans"] ? @"Fan" : page.capitalizedString]);
@@ -1632,6 +1754,20 @@ static BOOL ShowsStats(NSString *bundleID) {
     SaveSettingsNow();
     if (on) [self frontmostChanged:nil];
     else if (self.presentedBar == self.statsBar) [self hideStats];
+}
+
+- (void)toggleLockPanel:(id)sender {
+    BOOL on = !SettingBool(@"LockScreenPanel", YES);
+    gSettings[@"LockScreenPanel"] = @(on);
+    SaveSettingsNow();
+    [self hud:@"lock.rectangle" text:on ? @"Lock Screen Panel On" : @"Lock Screen Panel Off"];
+}
+
+- (void)previewPanel:(id)sender {
+    [HKStatusPanel.shared show];  // hides itself after 15 s
+    static uint64_t generation;
+    uint64_t mine = ++generation;
+    After(15, ^{ if (mine == generation) [HKStatusPanel.shared hide]; });
 }
 
 - (void)showFanPage:(id)sender {
@@ -2241,6 +2377,10 @@ static BOOL ShowsStats(NSString *bundleID) {
     NSMenuItem *stats = [self menuItem:@"System Stats on Desktop Touch Bar" action:@selector(toggleDesktopStats:) key:nil symbol:@"gauge.with.dots.needle.50percent"];
     stats.state = SettingBool(@"DesktopStats", YES);
     [menu addItem:stats];
+    NSMenuItem *panel = [self menuItem:@"Controls Panel on Lock & Login Screen" action:@selector(toggleLockPanel:) key:nil symbol:@"lock.rectangle"];
+    panel.state = SettingBool(@"LockScreenPanel", YES);
+    [menu addItem:panel];
+    [menu addItem:[self menuItem:@"Preview Lock Screen Panel" action:@selector(previewPanel:) key:nil symbol:@"eye"]];
 
     [menu addItem:NSMenuItem.separatorItem];
     [menu addItem:[self menuItem:@"Lock Screen" action:@selector(lock:) key:@"l" symbol:@"lock"]];
@@ -2275,6 +2415,7 @@ static int Usage(void) {
         "  headless on|off             keep the built-in display disabled\n"
         "  awake on|off                prevent system sleep on AC power\n"
         "  nightshift on|off|toggle\n"
+        "  lockpanel on|off            controls panel on the lock and login screens\n"
         "  mousescroll reverse|natural  wheel-mouse direction (trackpad unchanged)\n"
         "  fan [auto|smart|max|<rpm>]  fan mode (needs the headless-fand daemon)\n"
         "  fan curve <low°C> <high°C>  smart-mode curve (default 60 90)\n"
@@ -2332,6 +2473,7 @@ static int RunCLI(int argc, const char **argv) {
     else if ([cmd isEqualToString:@"keyboard"] && arg && ParsePercent(arg, &level)) { gSettings[@"KeyboardLevel"] = @(level); SaveSettingsNow(); if (!SetKeyboard(level)) return 1; }
     else if ([cmd isEqualToString:@"headless"] && arg && (on = ParseSwitch(arg)) >= 0) SetHeadless(on);
     else if ([cmd isEqualToString:@"awake"] && arg && (on = ParseSwitch(arg)) >= 0) { gSettings[@"KeepAwake"] = @(on); SaveSettingsNow(); }
+    else if ([cmd isEqualToString:@"lockpanel"] && arg && (on = ParseSwitch(arg)) >= 0) { gSettings[@"LockScreenPanel"] = @(on); SaveSettingsNow(); }
     else if ([cmd isEqualToString:@"mousescroll"] && arg && (!strcmp(arg, "reverse") || !strcmp(arg, "natural"))) {
         gSettings[@"ReverseMouseScroll"] = @(!strcmp(arg, "reverse"));
         SaveSettingsNow();

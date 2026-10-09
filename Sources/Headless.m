@@ -947,6 +947,7 @@ typedef NS_ENUM(UInt32, HKHotKey) {
 @property NSTouchBar *presentedBar;
 @property NSDate *presentedAt;
 @property BOOL screensaverRunning;
+@property BOOL closingStatsOurselves;  // so only the user's ✕ on the stats opens the menu
 - (void)hotKey:(HKHotKey)key;
 @end
 
@@ -1025,6 +1026,11 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
             if (bar.visible) return;
             if (self.presentedBar == bar) self.presentedBar = nil;
             After(0.3, ^{ [self registerTray]; });
+            // ✕ on the stats steps back to the controls menu; ✕ there closes everything.
+            if (bar == self.statsBar) {
+                if (!self.closingStatsOurselves) After(0.3, ^{ [self showControls:nil]; });
+                self.closingStatsOurselves = NO;
+            }
         });
         return;
     }
@@ -1172,10 +1178,9 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     [self buildStatsBar];
 
     self.tray = [[NSCustomTouchBarItem alloc] initWithIdentifier:TrayID];
-    // Sits where Apple's (dead) brightness button was: opens monitor brightness; its ‹ opens
-    // all Headless controls.
-    self.tray.view = [self barButton:@"sun.max.fill" fallback:nil title:nil action:@selector(showMonitorPage:)];
-    self.tray.view.accessibilityLabel = @"Monitor brightness and Headless controls";
+    // Sits where Apple's (dead) brightness button was. Tap: stats; ✕ there: all controls.
+    self.tray.view = [self barButton:@"slider.horizontal.3" fallback:nil title:nil action:@selector(showStats:)];
+    self.tray.view.accessibilityLabel = @"Headless stats and controls";
     [self watchVisibility:@[self.mainBar, self.statsBar]];
     After(2, ^{ [self updateControlStripLayout]; });
     // ControlStrip resolves private tray items through the app's current Touch Bar.
@@ -1309,6 +1314,7 @@ static BOOL ShowsStats(NSString *bundleID) {
 }
 
 - (void)hideStats {
+    self.closingStatsOurselves = YES;
     [self.statsTimer invalidate];
     self.statsTimer = nil;
     [NSTouchBar dismissSystemModalTouchBar:self.statsBar];
@@ -1517,6 +1523,7 @@ static BOOL ShowsStats(NSString *bundleID) {
 - (void)present:(NSTouchBar *)bar {
     if (!bar || !self.tray) return;  // no tray item = no Touch Bar (or no private API): menu bar only
     [self registerTray];
+    if (self.presentedBar == self.statsBar && bar != self.statsBar) self.closingStatsOurselves = YES;  // replaced, not ✕
     self.presentedBar = bar;
     self.presentedAt = [NSDate date];
     [NSTouchBar presentSystemModalTouchBar:bar systemTrayItemIdentifier:TrayID];

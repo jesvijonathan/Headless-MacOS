@@ -44,6 +44,7 @@ in the menu. Uninstalling also restores it. Each brightness control gets its own
 full-width page. Tap the end icons for ±10%.
 
 ![Touch Bar brightness page](docs/touchbar-touchbar.png)
+![Keyboard backlight page](docs/touchbar-keyboard.png)
 ![Monitor page](docs/touchbar-monitor.png)
 ![Display modes page](docs/touchbar-display.png)
 ![Fans page](docs/touchbar-fans.png)
@@ -81,7 +82,7 @@ These work well from Shortcuts.app ("Run Shell Script").
 Requires macOS 14+ and the Xcode Command Line Tools (`xcode-select --install`).
 
 ```sh
-git clone https://github.com/jesvijonathan/headless-mode-macos && cd headless-mode-macos
+git clone https://github.com/jesvijonathan/Headless-MacOS && cd Headless-MacOS
 make install        # builds, then sudo-installs /Applications/Headless.app + a LaunchAgent
 ```
 
@@ -89,7 +90,7 @@ make install        # builds, then sudo-installs /Applications/Headless.app + a 
 
 ```sh
 xcode-select --install          # once: compiler tools
-git clone https://github.com/jesvijonathan/headless-mode-macos && cd headless-mode-macos
+git clone https://github.com/jesvijonathan/Headless-MacOS && cd Headless-MacOS
 make install                    # agent + fan daemon, from boot, done
 ```
 

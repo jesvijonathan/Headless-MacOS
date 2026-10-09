@@ -36,7 +36,10 @@ ControlStrip restarts and Touch Bar power events, and idles at 0% CPU.
 
 ### Touch Bar
 
-A sliders button in the Control Strip opens the panel. Each brightness control gets its own
+Apple's Control Strip brightness button drives the missing built-in panel and does nothing,
+so Headless replaces it with its own ☀︎. Tap it for monitor brightness; the page's ‹ opens
+all controls. To bring Apple's button back, untick "Replace Control Strip Brightness Button"
+in the menu. Uninstalling also restores it. Each brightness control gets its own
 full-width page. Tap the end icons for ±10%.
 
 ![Touch Bar brightness page](docs/touchbar-touchbar.png)
@@ -110,10 +113,6 @@ re-assert every 15 s. Auto does no work at all.
   which shows only Apple's fixed keys, and global hotkeys are blocked by secure input.
   Headless keeps enforcing your settings underneath, but its buttons can't appear on those
   screens.
-- **Apple's Control Strip brightness button** controls the missing built-in panel, so it
-  does nothing on a panel-less Mac. macOS doesn't let apps re-route it, and hiding it through
-  a custom strip layout also hides third-party items. Use the Headless button next to it, or
-  ⌃⌥⌘ `=` / `-`, instead.
 - **Before macOS starts:** the Apple-logo boot screen, FileVault pre-boot unlock and Recovery
   all run before macOS does, so nothing can run there.
 - **Monitor brightness** is software dimming, which reduces contrast at low levels. If your

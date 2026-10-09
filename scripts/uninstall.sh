@@ -11,4 +11,9 @@ rm -rf /Applications/Headless.app
 launchctl bootout system/dev.jesvi.headless.fand 2>/dev/null || true  # hands fans back to macOS
 rm -f /Library/LaunchDaemons/dev.jesvi.headless.fand.plist /Library/PrivilegedHelperTools/dev.jesvi.headless.fand
 rm -rf "/Library/Application Support/Headless"
+# Put Apple's Control Strip brightness button back if Headless removed it.
+if ! sudo -u "$user" defaults read com.apple.controlstrip MiniCustomized 2>/dev/null | grep -q brightness; then
+    sudo -u "$user" defaults delete com.apple.controlstrip MiniCustomized 2>/dev/null
+    pkill -u "$uid" -x ControlStrip 2>/dev/null || true
+fi
 echo "Removed Headless. The built-in display stays disabled until restart or 'Headless headless off'."

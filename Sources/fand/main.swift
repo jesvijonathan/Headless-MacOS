@@ -98,8 +98,14 @@ var thermalEmergency: Bool {
 
 // MARK: - Control
 
+// On M1 the fan keeps following F0Tg after the mode flag is cleared, and F0Tg can no longer be
+// written once it is. So drop the target to the minimum while still forced, then clear the
+// flag: macOS raises the target from there when it needs cooling.
 func handBack() {
-    for fan in fans { smc.setFanMode(fan.id, mode: .automatic) }
+    for fan in fans {
+        if smc.getValue(smc.fanModeKey(fan.id)) == 1 { _ = smc.applyFanTarget(fan.id, Int(fan.min)) }
+        smc.setFanMode(fan.id, mode: .automatic)
+    }
     _ = smc.resetFanControl()
     lastTargets.removeAll()
 }

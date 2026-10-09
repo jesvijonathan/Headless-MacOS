@@ -1036,8 +1036,8 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     if (pid <= 0 || pid == self.controlStripPID) return;
     self.controlStripPID = pid;
     os_log(HKLog, "ControlStrip pid %d; registering tray item", pid);
-    // A freshly launched ControlStrip can ignore registrations for a moment; repeat (idempotent).
-    for (NSNumber *delay in @[@0.5, @2, @5]) After(delay.doubleValue, ^{ [self registerTray]; });
+    // A freshly launched ControlStrip ignores registrations for several seconds; repeat (idempotent).
+    for (NSNumber *delay in @[@1, @3, @6, @10]) After(delay.doubleValue, ^{ [self registerTray]; });
     After(0.5, ^{ ApplyTouchBar(); });
     After(5.5, ^{ if (self.presentedBar == self.statsBar) self.presentedBar = nil; [self frontmostChanged:nil]; });
 }
@@ -1046,6 +1046,31 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     if (!self.tray || ![NSTouchBarItem respondsToSelector:@selector(addSystemTrayItem:)]) return;
     [NSTouchBarItem addSystemTrayItem:self.tray];
     if (SetControlStripPresence) SetControlStripPresence(TrayID, YES);
+}
+
+// Apple's brightness button drives the built-in panel; with no panel it does nothing. Drop it
+// from the collapsed Control Strip so our ☀︎ (monitor brightness) takes its place. Only writes,
+// and restarts ControlStrip, when the layout actually has to change.
+- (void)updateControlStripLayout {
+    static NSString * const Native = @"com.apple.system.brightness";
+    CFStringRef domain = CFSTR("com.apple.controlstrip");
+    NSArray *current = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("MiniCustomized"), domain));
+    NSArray *base = [current isKindOfClass:NSArray.class] ? current
+        : @[Native, @"com.apple.system.volume", @"com.apple.system.mute", @"com.apple.system.siri"];
+    NSMutableArray *wanted = [base mutableCopy];
+    if (SettingBool(@"ReplaceBrightnessButton", YES)) [wanted removeObject:Native];
+    else if (![wanted containsObject:Native]) [wanted insertObject:Native atIndex:0];
+    if ([wanted isEqualToArray:base]) return;
+    CFPreferencesSetAppValue(CFSTR("MiniCustomized"), (__bridge CFArrayRef)wanted, domain);
+    CFPreferencesAppSynchronize(domain);
+    os_log(HKLog, "Control Strip layout updated; restarting ControlStrip");
+    [self restartTouchBar:nil];  // runningApplications KVO re-registers our item afterwards
+}
+
+- (void)toggleBrightnessButton:(id)sender {
+    gSettings[@"ReplaceBrightnessButton"] = @(!SettingBool(@"ReplaceBrightnessButton", YES));
+    SaveSettingsNow();
+    [self updateControlStripLayout];
 }
 
 #pragma mark Touch Bar
@@ -1147,9 +1172,12 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     [self buildStatsBar];
 
     self.tray = [[NSCustomTouchBarItem alloc] initWithIdentifier:TrayID];
-    self.tray.view = [self barButton:@"slider.horizontal.3" fallback:nil title:nil action:@selector(showControls:)];
-    self.tray.view.accessibilityLabel = @"Headless controls";
+    // Sits where Apple's (dead) brightness button was: opens monitor brightness; its ‹ opens
+    // all Headless controls.
+    self.tray.view = [self barButton:@"sun.max.fill" fallback:nil title:nil action:@selector(showMonitorPage:)];
+    self.tray.view.accessibilityLabel = @"Monitor brightness and Headless controls";
     [self watchVisibility:@[self.mainBar, self.statsBar]];
+    After(2, ^{ [self updateControlStripLayout]; });
     // ControlStrip resolves private tray items through the app's current Touch Bar.
     NSApp.touchBar = self.mainBar;
     [self refreshControls];
@@ -1958,6 +1986,9 @@ static BOOL ShowsStats(NSString *bundleID) {
     NSMenuItem *brightnessKeys = [self menuItem:@"Brightness Keys Control Monitor" action:@selector(toggleBrightnessKeys:) key:nil symbol:@"sun.max"];
     brightnessKeys.state = SettingBool(@"BrightnessKeysControlMonitor", YES);
     [menu addItem:brightnessKeys];
+    NSMenuItem *brightnessButton = [self menuItem:@"Replace Control Strip Brightness Button" action:@selector(toggleBrightnessButton:) key:nil symbol:@"sun.max"];
+    brightnessButton.state = SettingBool(@"ReplaceBrightnessButton", YES);
+    [menu addItem:brightnessButton];
     [menu addItem:[self menuItem:@"Restart Touch Bar" action:@selector(restartTouchBar:) key:nil symbol:@"arrow.triangle.2.circlepath"]];
 
     [menu addItem:NSMenuItem.separatorItem];

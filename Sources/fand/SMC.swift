@@ -161,7 +161,7 @@ extension Float {
 public class SMC {
     public static let shared = SMC()
 
-    // Headless: direct target write (mode=1 + target), verified by readback. Works on
+    // Headless: direct target write (mode=1 + target). Works on
     // M1-class machines without the Ftst unlock. Generalised from a single-fan helper.
     public func applyFanTarget(_ id: Int, _ speed: Int) -> Bool {
         guard let minimum = getValue("F\(id)Mn"), let maximum = getValue("F\(id)Mx"),
@@ -181,7 +181,9 @@ public class SMC {
             _ = write(previousMode)
             return false
         }
-        return getValue(fanModeKey(id)) == 1 && getValue("F\(id)Tg") == Double(speed)
+        // The SMC applies writes asynchronously, so an immediate readback can still show the old
+        // target; the daemon's next tick compares F0Tg and re-applies if it really did not stick.
+        return true
     }
 
     private var conn: io_connect_t = 0

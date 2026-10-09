@@ -2,6 +2,7 @@
 //
 //   • keeps the built-in display disabled whenever an external one is active
 //   • manual Touch Bar + keyboard backlight brightness (no ambient light sensor)
+//   • fan modes (auto / smart curve / custom RPM / max) via the root headless-fand daemon
 //   • external monitor brightness (software dimming), resolution / refresh
 //     rate, Night Shift, keep-awake, lock and display sleep, from the Control
 //     Strip, menu bar, global shortcuts (⌃⌥⌘) and a small CLI
@@ -22,6 +23,8 @@
 #import <notify.h>
 #import <objc/message.h>
 #import <os/log.h>
+#import <sys/socket.h>
+#import <sys/un.h>
 
 #define HKChangedNotify "dev.jesvi.headless.changed"
 #define HKShowNotify "dev.jesvi.headless.show"
@@ -376,6 +379,46 @@ static void SleepDisplays(void) {
     [NSTask launchedTaskWithExecutableURL:[NSURL fileURLWithPath:@"/usr/bin/pmset"] arguments:@[@"displaysleepnow"] error:NULL terminationHandler:nil];
 }
 
+#pragma mark - Fans
+
+// Fan control needs root, so it lives in the headless-fand LaunchDaemon; this is its client.
+static NSDictionary *FanRequest(NSString *line) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return nil;
+    struct sockaddr_un addr = {.sun_family = AF_UNIX};
+    const char *path = getenv("HEADLESS_FAND_SOCKET");
+    strlcpy(addr.sun_path, path ?: "/var/run/dev.jesvi.headless.fand.sock", sizeof addr.sun_path);
+    struct timeval timeout = {6, 0};  // the first forced-mode write can take a few seconds
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) { close(fd); return nil; }
+    const char *request = [line stringByAppendingString:@"\n"].UTF8String;
+    write(fd, request, strlen(request));
+    NSMutableData *reply = [NSMutableData data];
+    char chunk[1024];
+    ssize_t n;
+    while ((n = read(fd, chunk, sizeof chunk)) > 0) [reply appendBytes:chunk length:(NSUInteger)n];
+    close(fd);
+    id json = [NSJSONSerialization JSONObjectWithData:reply options:0 error:NULL];
+    return [json isKindOfClass:NSDictionary.class] ? json : nil;
+}
+
+static void FanRequestAsync(NSString *line, void (^done)(NSDictionary *reply)) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSDictionary *reply = FanRequest(line);
+        dispatch_async(dispatch_get_main_queue(), ^{ done(reply); });
+    });
+}
+
+static NSString *FanSummary(NSDictionary *status) {
+    if (!status) return @"Fan daemon not installed";
+    NSDictionary *fan = [status[@"fans"] firstObject];
+    return [NSString stringWithFormat:@"%.0f rpm · %.0f°", [fan[@"rpm"] doubleValue], [status[@"temp"] doubleValue]];
+}
+
+static NSString *FanModeTitle(NSString *mode) {
+    return @{@"auto": @"Auto", @"smart": @"Smart", @"custom": @"Custom", @"max": @"Max"}[mode] ?: mode;
+}
+
 #pragma mark - Wake (both modes)
 
 static void (^gOnWake)(void);
@@ -455,7 +498,7 @@ static NSImage *Symbol(NSString *name, NSString *fallback) {
 typedef NS_ENUM(UInt32, HKHotKey) {
     HKTouchBarUp = 1, HKTouchBarDown, HKKeyboardUp, HKKeyboardDown,
     HKShowControls, HKReapply, HKLock, HKSleepDisplays, HKToggleAwake, HKToggleNightShift,
-    HKMonitorUp, HKMonitorDown,
+    HKMonitorUp, HKMonitorDown, HKCycleFans,
 };
 
 @interface HKApp : NSObject <NSApplicationDelegate, NSMenuDelegate, NSScrubberDataSource, NSScrubberDelegate, NSScrubberFlowLayoutDelegate>
@@ -474,6 +517,12 @@ typedef NS_ENUM(UInt32, HKHotKey) {
 @property NSImageView *hudImage;
 @property NSTextField *hudText;
 @property NSTimer *safetyNet;
+@property NSTouchBar *fanPage, *fanCustomPage;
+@property NSDictionary<NSString *, NSButton *> *fanModeButtons;
+@property NSTextField *fanReadout, *fanValue;
+@property NSSlider *fanSlider;
+@property NSDictionary *fanStatus;
+@property NSDate *fanRefreshUntil;
 - (void)hotKey:(HKHotKey)key;
 @end
 
@@ -504,8 +553,8 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     int token;
     notify_register_dispatch(HKChangedNotify, &token, dispatch_get_main_queue(), ^(int t) { SettingsChangedElsewhere(); [weakSelf refreshControls]; });
     notify_register_dispatch(HKShowNotify, &token, dispatch_get_main_queue(), ^(int t) { [weakSelf showControls:nil]; });
-    for (NSString *page in @[@"display", @"touchbar", @"keyboard", @"monitor"]) {
-        SEL action = NSSelectorFromString([NSString stringWithFormat:@"show%@Page:", [page isEqualToString:@"touchbar"] ? @"TouchBar" : page.capitalizedString]);
+    for (NSString *page in @[@"display", @"touchbar", @"keyboard", @"monitor", @"fans"]) {
+        SEL action = NSSelectorFromString([NSString stringWithFormat:@"show%@Page:", [page isEqualToString:@"touchbar"] ? @"TouchBar" : [page isEqualToString:@"fans"] ? @"Fan" : page.capitalizedString]);
         notify_register_dispatch([@HKShowNotify "." stringByAppendingString:page].UTF8String, &token, dispatch_get_main_queue(), ^(int t) {
             ((void (*)(id, SEL, id))objc_msgSend)(weakSelf, action, nil);
         });
@@ -609,7 +658,8 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     for (NSView *view in button.superview.subviews) {
         if (![view isKindOfClass:NSSlider.class]) continue;
         NSSlider *slider = (NSSlider *)view;
-        slider.doubleValue = fmax(0, fmin(100, round(slider.doubleValue / 10) * 10 + button.tag));
+        double step = (slider.maxValue - slider.minValue) * button.tag / 100;
+        slider.doubleValue = fmax(slider.minValue, fmin(slider.maxValue, round(slider.doubleValue + step)));
         [NSApp sendAction:slider.action to:slider.target from:slider];
     }
 }
@@ -647,19 +697,33 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     ]];
     self.monitorPage.defaultItemIdentifiers = @[@"back", @"slider", @"value", NSTouchBarItemIdentifierFixedSpaceSmall, @"sleep", @"modes"];
     self.displayButton = [self barButton:@"display" fallback:nil title:@"Monitor" action:@selector(showMonitorPage:)];
-    self.nightShiftButton = [self barButton:@"moon.fill" fallback:nil title:@"Night Shift" action:@selector(toggleNightShift:)];
     self.awakeButton = [self barButton:@"cup.and.saucer.fill" fallback:@"bolt.fill" title:@"Awake" action:@selector(toggleAwake:)];
-    for (NSButton *button in @[self.displayButton, self.nightShiftButton, self.awakeButton]) [self fixedWidth:114 button:button];
+    self.nightShiftButton = [self barButton:@"moon.fill" fallback:nil title:@"Night" action:@selector(toggleNightShift:)];
+    NSButton *fansButton = [self barButton:@"fan.fill" fallback:@"wind" title:@"Fans" action:@selector(showFanPage:)];
+    NSButton *touchBarButton = [self barButton:@"sun.max.fill" fallback:nil title:@"Touch Bar" action:@selector(showTouchBarPage:)];
+    NSButton *keyboardButton = [self barButton:@"keyboard" fallback:@"light.max" title:@"Keyboard" action:@selector(showKeyboardPage:)];
+    // Labelled buttons only fit the ~640 pt modal area with a slightly smaller title.
+    NSArray *row = @[touchBarButton, keyboardButton, self.displayButton, self.nightShiftButton, self.awakeButton, fansButton];
+    NSArray *widths = @[@102, @100, @92, @82, @86, @78];
+    for (NSUInteger i = 0; i < row.count; i++) {
+        NSButton *button = row[i];
+        button.font = [NSFont systemFontOfSize:13];
+        button.imageHugsTitle = YES;
+        [self fixedWidth:[widths[i] doubleValue] button:button];
+    }
     NSArray *mainItems = @[
-        [self item:@"tb" view:[self fixedWidth:114 button:[self barButton:@"sun.max.fill" fallback:nil title:@"Touch Bar" action:@selector(showTouchBarPage:)]] label:@"Touch Bar Brightness"],
-        [self item:@"kb" view:[self fixedWidth:114 button:[self barButton:@"keyboard" fallback:@"light.max" title:@"Keyboard" action:@selector(showKeyboardPage:)]] label:@"Keyboard Backlight"],
+        [self item:@"tb" view:touchBarButton label:@"Touch Bar Brightness"],
+        [self item:@"kb" view:keyboardButton label:@"Keyboard Backlight"],
         [self item:@"display" view:self.displayButton label:@"Monitor"],
         [self item:@"nightshift" view:self.nightShiftButton label:@"Night Shift"],
         [self item:@"awake" view:self.awakeButton label:@"Keep Awake"],
+        [self item:@"fans" view:fansButton label:@"Fans"],
     ];
     self.mainBar = [NSTouchBar new];
     self.mainBar.templateItems = [NSSet setWithArray:mainItems];
-    self.mainBar.defaultItemIdentifiers = @[@"tb", @"kb", @"display", @"nightshift", @"awake"];
+    self.mainBar.defaultItemIdentifiers = @[@"tb", @"kb", @"display", @"nightshift", @"awake", @"fans"];
+
+    [self buildFanPages];
 
     self.headlessButton = [self barButton:@"laptopcomputer" fallback:nil title:@"Built-in Off" action:@selector(toggleHeadless:)];
     NSScrubberFlowLayout *layout = [NSScrubberFlowLayout new];
@@ -710,6 +774,101 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     ]];
     bar.defaultItemIdentifiers = @[@"back", NSTouchBarItemIdentifierFixedSpaceSmall, @"slider", @"value"];
     return bar;
+}
+
+// ‹  Auto  Smart  Custom  Max      1650 rpm · 63°
+- (void)buildFanPages {
+    NSMutableDictionary *buttons = [NSMutableDictionary dictionary];
+    NSMutableArray *items = [NSMutableArray arrayWithObject:
+        [self item:@"back" view:[self barButton:@"chevron.left" fallback:nil title:nil action:@selector(showMainPage:)] label:@"Back"]];
+    NSDictionary *symbols = @{@"auto": @"a.circle", @"smart": @"thermometer.medium", @"custom": @"slider.horizontal.3", @"max": @"wind"};
+    for (NSString *mode in @[@"auto", @"smart", @"custom", @"max"]) {
+        NSButton *button = [self fixedWidth:96 button:[self barButton:symbols[mode] fallback:@"fan" title:FanModeTitle(mode) action:@selector(fanModeTapped:)]];
+        button.identifier = mode;
+        buttons[mode] = button;
+        [items addObject:[self item:mode view:button label:[FanModeTitle(mode) stringByAppendingString:@" Fans"]]];
+    }
+    self.fanModeButtons = buttons;
+    self.fanReadout = [NSTextField labelWithString:@"…"];
+    self.fanReadout.font = [NSFont monospacedDigitSystemFontOfSize:14 weight:NSFontWeightMedium];
+    self.fanReadout.textColor = NSColor.secondaryLabelColor;
+    [items addObject:[self item:@"readout" view:self.fanReadout label:@"Fan Speed"]];
+    self.fanPage = [NSTouchBar new];
+    self.fanPage.templateItems = [NSSet setWithArray:items];
+    self.fanPage.defaultItemIdentifiers = @[@"back", @"auto", @"smart", @"custom", @"max", NSTouchBarItemIdentifierFixedSpaceSmall, @"readout"];
+
+    NSSlider *slider;
+    NSCustomTouchBarItem *sliderItem = [self slider:&slider width:300 min:@"fan" max:@"fan.fill" label:@"Custom Fan Speed" action:@selector(fanSliderMoved:)];
+    self.fanSlider = slider;
+    self.fanValue = [self valueLabel];
+    [self.fanValue.widthAnchor constraintEqualToConstant:90].active = YES;
+    self.fanCustomPage = [NSTouchBar new];
+    self.fanCustomPage.templateItems = [NSSet setWithArray:@[
+        [self item:@"back" view:[self barButton:@"chevron.left" fallback:nil title:nil action:@selector(showFanPage:)] label:@"Back"],
+        sliderItem,
+        [self item:@"value" view:self.fanValue label:@"RPM"],
+    ]];
+    self.fanCustomPage.defaultItemIdentifiers = @[@"back", NSTouchBarItemIdentifierFixedSpaceSmall, @"slider", @"value"];
+}
+
+- (void)showFanPage:(id)sender {
+    [self present:self.fanPage];
+    self.fanRefreshUntil = [NSDate dateWithTimeIntervalSinceNow:60];
+    [self refreshFans];
+}
+
+// Live readout while the page is likely visible: every 2 s for a minute after opening.
+- (void)refreshFans {
+    FanRequestAsync(@"status", ^(NSDictionary *status) {
+        [self showFanStatus:status];
+        if (status && self.fanRefreshUntil.timeIntervalSinceNow > 0) After(2, ^{ [self refreshFans]; });
+    });
+}
+
+- (void)showFanStatus:(NSDictionary *)status {
+    self.fanStatus = status;
+    self.fanReadout.stringValue = FanSummary(status);
+    for (NSString *mode in self.fanModeButtons) {
+        NSButton *button = self.fanModeButtons[mode];
+        button.enabled = status != nil;
+        [self setToggle:button on:[status[@"mode"] isEqualToString:mode] color:[mode isEqualToString:@"max"] ? NSColor.systemRedColor : NSColor.systemBlueColor];
+    }
+    NSDictionary *fan = [status[@"fans"] firstObject];
+    if (fan) {
+        self.fanSlider.minValue = [fan[@"min"] doubleValue];
+        self.fanSlider.maxValue = [fan[@"max"] doubleValue];
+    }
+}
+
+- (void)fanModeTapped:(NSButton *)button {
+    if ([button.identifier isEqualToString:@"custom"]) {
+        self.fanSlider.doubleValue = [self.fanStatus[@"custom"] doubleValue];
+        self.fanValue.stringValue = [NSString stringWithFormat:@"%.0f rpm", self.fanSlider.doubleValue];
+        [self present:self.fanCustomPage];
+        [self sendFanRequest:[NSString stringWithFormat:@"set custom %.0f", self.fanSlider.doubleValue] hud:NO];
+        return;
+    }
+    [self sendFanRequest:[@"set " stringByAppendingString:button.identifier] hud:YES];
+}
+
+- (void)fanSliderMoved:(NSSlider *)slider {
+    double rpm = round(slider.doubleValue / 50) * 50;
+    self.fanValue.stringValue = [NSString stringWithFormat:@"%.0f rpm", rpm];
+    // Dragging fires continuously; send once it settles.
+    static uint64_t generation;
+    uint64_t mine = ++generation;
+    After(0.3, ^{ if (mine == generation) [self sendFanRequest:[NSString stringWithFormat:@"set custom %.0f", rpm] hud:NO]; });
+}
+
+- (void)sendFanRequest:(NSString *)request hud:(BOOL)hud {
+    FanRequestAsync(request, ^(NSDictionary *reply) {
+        if (!reply || reply[@"error"]) {
+            [self hud:@"exclamationmark.triangle.fill" text:reply[@"error"] ? @"Fans: not allowed" : @"Fan daemon not installed"];
+            return;
+        }
+        [self showFanStatus:reply];
+        if (hud) [self hud:@"fan.fill" text:[NSString stringWithFormat:@"Fans: %@", FanModeTitle(reply[@"mode"])]];
+    });
 }
 
 - (void)present:(NSTouchBar *)bar {
@@ -867,7 +1026,7 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
 - (void)dismissBar {
     if ([NSTouchBar respondsToSelector:@selector(dismissSystemModalTouchBar:)]) {
         [NSTouchBar dismissSystemModalTouchBar:self.mainBar];
-        for (NSTouchBar *bar in @[self.displayBar, self.touchBarPage, self.keyboardPage, self.monitorPage]) [NSTouchBar dismissSystemModalTouchBar:bar];
+        for (NSTouchBar *bar in @[self.displayBar, self.touchBarPage, self.keyboardPage, self.monitorPage, self.fanPage, self.fanCustomPage]) [NSTouchBar dismissSystemModalTouchBar:bar];
     }
 }
 
@@ -888,7 +1047,7 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
         {HKKeyboardUp, kVK_RightArrow}, {HKKeyboardDown, kVK_LeftArrow},
         {HKShowControls, kVK_ANSI_T}, {HKReapply, kVK_ANSI_H}, {HKLock, kVK_ANSI_L},
         {HKSleepDisplays, kVK_ANSI_S}, {HKToggleAwake, kVK_ANSI_A}, {HKToggleNightShift, kVK_ANSI_N},
-        {HKMonitorUp, kVK_ANSI_Equal}, {HKMonitorDown, kVK_ANSI_Minus},
+        {HKMonitorUp, kVK_ANSI_Equal}, {HKMonitorDown, kVK_ANSI_Minus}, {HKCycleFans, kVK_ANSI_F},
     };
     for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
         EventHotKeyRef ref;
@@ -917,6 +1076,14 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
         case HKSleepDisplays: [self sleepDisplays:nil]; break;
         case HKToggleAwake: [self toggleAwake:nil]; break;
         case HKToggleNightShift: [self toggleNightShift:nil]; break;
+        case HKCycleFans: {
+            FanRequestAsync(@"status", ^(NSDictionary *status) {
+                NSString *mode = status[@"mode"];
+                NSString *next = [mode isEqualToString:@"auto"] ? @"smart" : [mode isEqualToString:@"smart"] ? @"max" : @"auto";
+                [self sendFanRequest:[@"set " stringByAppendingString:next] hud:YES];
+            });
+            break;
+        }
         case HKMonitorUp: case HKMonitorDown:
             [self setMonitorLevel:round(SettingLevel(@"MonitorLevel", 1.0) * 10 + (key == HKMonitorUp ? 1 : -1)) / 10];
             [self hud:@"display" text:[NSString stringWithFormat:@"Monitor  %.0f%%", SettingLevel(@"MonitorLevel", 1.0) * 100]];
@@ -1017,6 +1184,23 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
         if ([view.identifier isEqualToString:@"percent"]) ((NSTextField *)view).stringValue = [NSString stringWithFormat:@"%.0f%%", round(slider.doubleValue)];
 }
 - (void)menuTouchBarMoved:(NSSlider *)slider { [self menuSliderMoved:slider]; [self touchBarSliderMoved:slider]; }
+- (void)menuFanMode:(NSMenuItem *)item {
+    NSString *mode = item.representedObject;
+    if ([mode isEqualToString:@"custom"]) {
+        NSDictionary *status = FanRequest(@"status");
+        [self sendFanRequest:[NSString stringWithFormat:@"set custom %.0f", [status[@"custom"] doubleValue]] hud:YES];
+    } else {
+        [self sendFanRequest:[@"set " stringByAppendingString:mode] hud:YES];
+    }
+}
+- (void)menuFanMoved:(NSSlider *)slider {
+    double rpm = round(slider.doubleValue / 50) * 50;
+    for (NSView *view in slider.superview.subviews)
+        if ([view.identifier isEqualToString:@"percent"]) ((NSTextField *)view).stringValue = [NSString stringWithFormat:@"%.0f rpm", rpm];
+    static uint64_t generation;
+    uint64_t mine = ++generation;
+    After(0.3, ^{ if (mine == generation) [self sendFanRequest:[NSString stringWithFormat:@"set custom %.0f", rpm] hud:NO]; });
+}
 - (void)menuMonitorMoved:(NSSlider *)slider { [self menuSliderMoved:slider]; [self monitorSliderMoved:slider]; }
 - (void)menuKeyboardMoved:(NSSlider *)slider { [self menuSliderMoved:slider]; [self keyboardSliderMoved:slider]; }
 
@@ -1078,6 +1262,33 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     [menu addItem:[self sliderRow:@"keyboard" value:isfinite(keyboard) ? round(keyboard * 100) : 100 action:@selector(menuKeyboardMoved:) label:@"Keyboard backlight"]];
 
     [menu addItem:NSMenuItem.separatorItem];
+    NSDictionary *fans = FanRequest(@"status");
+    [menu addItem:[NSMenuItem sectionHeaderWithTitle:[NSString stringWithFormat:@"Fans  ⌃⌥⌘F  —  %@", FanSummary(fans)]]];
+    if (fans) {
+        for (NSString *mode in @[@"auto", @"smart", @"custom", @"max"]) {
+            NSMenuItem *item = [self menuItem:FanModeTitle(mode) action:@selector(menuFanMode:) key:nil symbol:nil];
+            item.representedObject = mode;
+            item.state = [fans[@"mode"] isEqualToString:mode];
+            [menu addItem:item];
+        }
+        NSDictionary *fan = [fans[@"fans"] firstObject];
+        NSMenuItem *row = [self sliderRow:@"fan" value:0 action:@selector(menuFanMoved:) label:@"Custom fan speed"];
+        for (NSView *view in row.view.subviews) {
+            if ([view isKindOfClass:NSSlider.class]) {
+                NSSlider *slider = (NSSlider *)view;
+                slider.minValue = [fan[@"min"] doubleValue];
+                slider.maxValue = [fan[@"max"] doubleValue];
+                slider.doubleValue = [fans[@"custom"] doubleValue];
+                slider.frame = NSMakeRect(40, 5, 160, 20);
+            } else if ([view.identifier isEqualToString:@"percent"]) {
+                view.frame = NSMakeRect(200, 7, 64, 16);
+                ((NSTextField *)view).stringValue = [NSString stringWithFormat:@"%.0f rpm", [fans[@"custom"] doubleValue]];
+            }
+        }
+        [menu addItem:row];
+    }
+
+    [menu addItem:NSMenuItem.separatorItem];
     NSMenuItem *awake = [self menuItem:@"Keep Mac Awake" action:@selector(toggleAwake:) key:@"a" symbol:@"cup.and.saucer"];
     awake.state = SettingBool(@"KeepAwake", YES);
     [menu addItem:awake];
@@ -1111,9 +1322,11 @@ static int Usage(void) {
         "  headless on|off             keep the built-in display disabled\n"
         "  awake on|off                prevent system sleep on AC power\n"
         "  nightshift on|off|toggle\n"
+        "  fan [auto|smart|max|<rpm>]  fan mode (needs the headless-fand daemon)\n"
+        "  fan curve <low°C> <high°C>  smart-mode curve (default 60 90)\n"
         "  modes                       list modes for the external display\n"
         "  mode <index>                switch to a mode from `modes`\n"
-        "  lock | sleep-display | show [touchbar|keyboard|monitor|display]\n");
+        "  lock | sleep-display | show [touchbar|keyboard|monitor|display|fans]\n");
     return 2;
 }
 
@@ -1150,6 +1363,8 @@ static int RunCLI(int argc, const char **argv) {
         printf("keyboard      %s saved, %.0f%% actual\n", HasSetting(@"KeyboardLevel") ? [NSString stringWithFormat:@"%.0f%%", SettingLevel(@"KeyboardLevel", 1.0) * 100].UTF8String : "not", KeyboardCurrent() * 100);
         printf("keep awake    %s\n", SettingBool(@"KeepAwake", YES) ? "on" : "off");
         printf("night shift   %s\n", NightShiftOn() ? "on" : "off");
+        NSDictionary *fans = FanRequest(@"status");
+        printf("fans          %s%s\n", fans ? [FanModeTitle(fans[@"mode"]) stringByAppendingString:@", "].UTF8String : "", FanSummary(fans).UTF8String);
         return 0;
     }
     if ([cmd isEqualToString:@"apply"]) { EnforceHeadless(); ApplyTouchBar(); ApplyKeyboard(); }
@@ -1179,6 +1394,17 @@ static int RunCLI(int argc, const char **argv) {
             printf("%3lu %s %-22s %s\n", (unsigned long)i, [ModeKey(m) isEqualToString:ModeKey(current)] ? "*" : " ", SizeString(m).UTF8String, RateString(CGDisplayModeGetRefreshRate(m)).UTF8String);
         }
         CGDisplayModeRelease(current);
+        return 0;
+    }
+    else if ([cmd isEqualToString:@"fan"]) {
+        NSString *request = @"status";
+        if (arg && !strcmp(arg, "curve") && argc > 4) request = [NSString stringWithFormat:@"curve %s %s", argv[3], argv[4]];
+        else if (arg && atoi(arg) > 0) request = [NSString stringWithFormat:@"set custom %d", atoi(arg)];
+        else if (arg) request = [NSString stringWithFormat:@"set %s", arg];
+        NSDictionary *reply = FanRequest(request);
+        if (!reply) { fprintf(stderr, "Fan daemon not running (install with `make install`)\n"); return 1; }
+        if (reply[@"error"]) { fprintf(stderr, "%s\n", [reply[@"error"] UTF8String]); return 1; }
+        printf("%s: %s (smart curve %.0f–%.0f°C)\n", FanModeTitle(reply[@"mode"]).UTF8String, FanSummary(reply).UTF8String, [reply[@"low"] doubleValue], [reply[@"high"] doubleValue]);
         return 0;
     }
     else if ([cmd isEqualToString:@"lock"]) LockScreen();

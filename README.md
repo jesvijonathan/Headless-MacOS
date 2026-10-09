@@ -2,8 +2,8 @@
 
 **Run a MacBook with no built-in screen, cleanly.** One tiny, event-driven macOS agent for
 lid-less / panel-less MacBooks driving an external monitor. It keeps the built-in display
-disabled, gives you manual brightness control for the Touch Bar, keyboard and monitor, and
-adds headless-friendly toggles. It works from the Control Strip, the menu bar, global
+disabled, gives you manual brightness control for the Touch Bar, keyboard and monitor,
+controls the fans, and adds headless-friendly toggles. It works from the Control Strip, the menu bar, global
 shortcuts and a CLI.
 
 ![Main Touch Bar row](docs/touchbar-main.png)
@@ -26,6 +26,7 @@ ControlStrip restarts and Touch Bar power events, and idles at 0% CPU.
 | **Keyboard backlight** | Manual level, restored on launch/wake only, so macOS idle dimming still works. |
 | **Monitor brightness** | Software dimming (gamma) for monitors without DDC, with a 12% floor so your only screen never goes black. |
 | **Display modes** | Resolution and refresh-rate switching, including HiDPI modes. |
+| **Fan control** | Auto (macOS), Smart (temperature curve, 60–90 °C by default), Custom RPM, or Max. Runs from boot as a small root daemon. |
 | **Keep awake** | Prevents system sleep on AC power (like `caffeinate -s`); displays may still sleep. |
 | **Night Shift, Sleep display, Lock** | One tap or one shortcut. |
 | **From boot** | Runs in the login-window session too, so the display, brightness and awake state are applied before you sign in. |
@@ -38,6 +39,7 @@ full-width page. Tap the end icons for ±10%.
 ![Touch Bar brightness page](docs/touchbar-touchbar.png)
 ![Monitor page](docs/touchbar-monitor.png)
 ![Display modes page](docs/touchbar-display.png)
+![Fans page](docs/touchbar-fans.png)
 
 ### Shortcuts (⌃⌥⌘ +)
 
@@ -47,6 +49,7 @@ full-width page. Tap the end icons for ±10%.
 | `↑` / `↓` | Touch Bar brightness ±10% | `H` | re-apply display settings |
 | `→` / `←` | keyboard backlight ±10% | `L` / `S` | lock / sleep display |
 | `A` | keep awake | `N` | Night Shift |
+| `F` | fans: Auto → Smart → Max | | |
 
 ### CLI
 
@@ -56,7 +59,8 @@ $H status                      # displays, levels, toggles
 $H touchbar 70 | keyboard 40 | monitor 60
 $H headless on|off | awake on|off | nightshift toggle
 $H modes ; $H mode 3           # list / switch display modes
-$H lock | sleep-display | show [touchbar|keyboard|monitor|display]
+$H fan [auto|smart|max|<rpm>]  # fan mode;  $H fan curve 55 85  # smart curve
+$H lock | sleep-display | show [touchbar|keyboard|monitor|display|fans]
 ```
 
 These work well from Shortcuts.app ("Run Shell Script").
@@ -77,6 +81,14 @@ The LaunchAgent (`/Library/LaunchAgents/dev.jesvi.headless.plist`) loads in both
 **LoginWindow** and **Aqua** sessions. Before login, it only applies state. After login, it
 becomes the full app.
 
+Fan control runs in a separate root LaunchDaemon (`dev.jesvi.headless.fand`), because SMC
+writes need root. It starts at boot and listens on `/var/run/dev.jesvi.headless.fand.sock`.
+Anyone can read status, but only administrators can change modes. When it stops, or after
+uninstalling, the fans go back to macOS. In any mode it jumps to max fan speed if macOS
+reports a serious thermal state. Don't run it alongside another fan controller such as
+Macs Fan Control, because they'll fight. Smart mode reads sensors every 3 s, and fixed modes
+re-assert every 15 s. Auto does no work at all.
+
 ## Limitations
 
 - **Lock screen and login window UI:** there, macOS hands the Touch Bar to `loginwindow`,
@@ -88,7 +100,10 @@ becomes the full app.
 - **Monitor brightness** is software dimming, which reduces contrast at low levels. If your
   monitor supports DDC, a DDC tool such as MonitorControl gives true backlight control.
   Don't dim with both tools at once, or they'll fight over the gamma table.
-- **Private APIs:** Headless uses SkyLight, DFRBrightness, CoreBrightness and DFRFoundation.
+- **Fans:** fan control needs Apple Silicon (built and tested on M1). Smart mode uses the
+  90th percentile of the CPU/GPU die sensors.
+- **Private APIs:** Headless uses SkyLight, DFRBrightness, CoreBrightness, DFRFoundation and
+  undocumented SMC keys.
   A macOS update may break something; please open an issue.
 
 Tested on MacBookPro17,1 (M1, Touch Bar) running macOS 27. Machines without a Touch Bar get
@@ -96,8 +111,9 @@ the menu bar, shortcuts and CLI.
 
 ## How it works
 
-Everything is in [`Sources/Headless.m`](Sources/Headless.m), about 1,200 lines of Objective-C
-with no dependencies.
+The agent is [`Sources/Headless.m`](Sources/Headless.m), Objective-C with no dependencies. The
+fan daemon is [`Sources/fand`](Sources/fand), Swift, and its SMC access comes from
+[Stats](https://github.com/exelban/stats) under the MIT license.
 
 - `SLSConfigureDisplayEnabled` (SkyLight) turns the built-in panel off for the session, like
   [clamless](https://github.com/TCXM/clamless).

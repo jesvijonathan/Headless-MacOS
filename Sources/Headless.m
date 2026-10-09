@@ -659,6 +659,7 @@ static void UpdateScrollReversal(BOOL promptForPermission) {
         }
         gScrollTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
                                       CGEventMaskBit(kCGEventScrollWheel), ScrollTapped, NULL);
+        os_log(HKLog, "Mouse scroll reversal %{public}s", gScrollTap ? "active" : "could not create event tap");
         if (!gScrollTap) return;
         CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(NULL, gScrollTap, 0);
         CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
@@ -1133,6 +1134,7 @@ static BOOL ShowsStats(NSString *bundleID) {
 }
 
 - (void)frontmostChanged:(NSNotification *)note {
+    if (!gScrollTap) UpdateScrollReversal(NO);  // permission may have just been granted
     BOOL desktop = ShowsStats(NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier);
     BOOL ourPanelInUse = self.presentedBar && self.presentedBar != self.statsBar && self.presentedAt.timeIntervalSinceNow > -60;
     if (desktop && SettingBool(@"DesktopStats", YES) && !ourPanelInUse) {
@@ -1821,7 +1823,8 @@ static int RunCLI(int argc, const char **argv) {
         printf("keep awake    %s\n", SettingBool(@"KeepAwake", YES) ? "on" : "off");
         printf("night shift   %s\n", NightShiftOn() ? "on" : "off");
         printf("mouse scroll  %s\n", !SettingBool(@"ReverseMouseScroll", NO) ? "natural (system setting)"
-               : AXIsProcessTrusted() ? "reversed" : "reversed - needs Accessibility permission for Headless");
+               : AXIsProcessTrusted() ? "reversed (see 'Reverse Mouse Scrolling' in the menu if it has no effect)"
+               : "reversed - needs Accessibility permission for Headless");
         printf("temperature   %.0f°C (SoC, %lu sensors)\n", SocTemperature(), (unsigned long)SocSensors().count);
         printf("fan speed     %.0f rpm\n", FanRPM());
         NSDictionary *fans = FanRequest(@"status");

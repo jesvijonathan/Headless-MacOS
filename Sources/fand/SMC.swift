@@ -391,6 +391,9 @@ public class SMC {
     // MARK: - fans
     
     public func fanModeKey(_ id: Int) -> String {
+        // Headless: M1-class SMCs expose a writable "F0Md" and may also report an unrelated
+        // "F0md"; prefer the uppercase key whenever it exists.
+        if getValue("F\(id)Md") != nil { return "F\(id)Md" }
         #if arch(arm64)
         if _fanModeKeyIsLower == nil {
             var probe = SMCVal_t("F0md")

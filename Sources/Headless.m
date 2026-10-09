@@ -1318,6 +1318,7 @@ typedef NS_ENUM(UInt32, HKHotKey) {
 @property BOOL screensaverRunning;
 @property BOOL closingStatsOurselves;  // so only the user's ✕ on the stats returns to the menu
 @property BOOL statsFromMenu;          // stats opened with the menu's Stats button
+@property BOOL statsManual;            // stats opened by the user, not shown automatically at the desktop
 - (void)hotKey:(HKHotKey)key;
 @end
 
@@ -1396,6 +1397,12 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
 
 #pragma mark Control Strip
 
+static BOOL RecentClickOrKey(void) {
+    for (NSNumber *type in @[@(kCGEventLeftMouseDown), @(kCGEventRightMouseDown), @(kCGEventOtherMouseDown), @(kCGEventKeyDown)])
+        if (CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState, (CGEventType)type.intValue) < 0.6) return YES;
+    return NO;
+}
+
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
     if (context == (__bridge void *)TrayID) {
         NSTouchBar *bar = object;
@@ -1403,12 +1410,21 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
             if (bar.visible) return;
             if (self.presentedBar == bar) self.presentedBar = nil;
             After(0.3, ^{ [self registerTray]; });
-            // ✕ on stats opened from the menu steps back to the menu; ✕ there closes everything.
-            if (bar == self.statsBar) {
-                if (!self.closingStatsOurselves && self.statsFromMenu) After(0.3, ^{ [self showControls:nil]; });
-                self.closingStatsOurselves = NO;
-                self.statsFromMenu = NO;
+            if (bar != self.statsBar) return;
+            // macOS also closes the stats when the frontmost app changes its own Touch Bar, e.g. on a
+            // click in a video. The ✕ is a Touch Bar tap, not a click or key press, so a click or
+            // key press just before the close means it was interrupted, not dismissed.
+            BOOL ours = self.closingStatsOurselves, interrupted = !ours && RecentClickOrKey();
+            self.closingStatsOurselves = NO;
+            if (interrupted && SettingBool(@"KeepStatsOpen", YES) && (self.statsManual || self.atDesktop)) {
+                os_log(HKLog, "Stats interrupted; showing them again");
+                After(0.3, ^{ if (!self.presentedBar) [self presentStats]; });
+                return;
             }
+            // ✕ on stats opened from the menu steps back to the menu; ✕ there closes everything.
+            if (!ours && !interrupted && self.statsFromMenu) After(0.3, ^{ [self showControls:nil]; });
+            self.statsFromMenu = NO;
+            self.statsManual = NO;
         });
         return;
     }
@@ -1662,10 +1678,10 @@ static BOOL ShowsStats(NSString *bundleID) {
         // then check it actually appeared and retry once if not.
         After(0.5, ^{
             if (!self.atDesktop) return;
-            [self showStats:nil];
-            After(1.0, ^{ if (self.atDesktop && !self.statsBar.visible) [self showStats:nil]; });
+            [self presentStats];
+            After(1.0, ^{ if (self.atDesktop && !self.statsBar.visible) [self presentStats]; });
         });
-    } else if (!self.atDesktop && self.presentedBar == self.statsBar) {
+    } else if (!self.atDesktop && self.presentedBar == self.statsBar && !(self.statsManual && SettingBool(@"KeepStatsOpen", YES))) {
         [self hideStats];
     }
 }
@@ -1673,7 +1689,13 @@ static BOOL ShowsStats(NSString *bundleID) {
 - (void)screensaverStarted:(NSNotification *)note { self.screensaverRunning = YES; [self frontmostChanged:nil]; }
 - (void)screensaverStopped:(NSNotification *)note { self.screensaverRunning = NO; [self frontmostChanged:nil]; }
 
+// Opened by the user (menu, shortcut, CLI): with Keep Stats Open it stays until ✕.
 - (void)showStats:(id)sender {
+    self.statsManual = YES;
+    [self presentStats];
+}
+
+- (void)presentStats {
     if (!self.statsBar) return;
     NSString *symbol;
     BOOL battery = BatteryText(&symbol) != nil;  // desktops have none
@@ -1692,7 +1714,7 @@ static BOOL ShowsStats(NSString *bundleID) {
 }
 
 - (void)showStatsFromMenu:(id)sender {
-    [self showStats:sender];
+    [self showStats:sender];  // sets statsManual
     self.statsFromMenu = YES;
 }
 
@@ -1756,6 +1778,13 @@ static BOOL ShowsStats(NSString *bundleID) {
     SaveSettingsNow();
     if (on) [self frontmostChanged:nil];
     else if (self.presentedBar == self.statsBar) [self hideStats];
+}
+
+- (void)toggleKeepStats:(id)sender {
+    BOOL on = !SettingBool(@"KeepStatsOpen", YES);
+    gSettings[@"KeepStatsOpen"] = @(on);
+    SaveSettingsNow();
+    [self hud:@"pin" text:on ? @"Stats Stay Open" : @"Stats Close When Interrupted"];
 }
 
 - (void)toggleLockPanel:(id)sender {
@@ -2379,6 +2408,9 @@ static BOOL ShowsStats(NSString *bundleID) {
     NSMenuItem *stats = [self menuItem:@"System Stats on Desktop Touch Bar" action:@selector(toggleDesktopStats:) key:nil symbol:@"gauge.with.dots.needle.50percent"];
     stats.state = SettingBool(@"DesktopStats", YES);
     [menu addItem:stats];
+    NSMenuItem *keepStats = [self menuItem:@"Keep Stats Open Until ✕" action:@selector(toggleKeepStats:) key:nil symbol:@"pin"];
+    keepStats.state = SettingBool(@"KeepStatsOpen", YES);
+    [menu addItem:keepStats];
     NSMenuItem *panel = [self menuItem:@"Controls Panel on Lock & Login Screen" action:@selector(toggleLockPanel:) key:nil symbol:@"lock.rectangle"];
     panel.state = SettingBool(@"LockScreenPanel", YES);
     [menu addItem:panel];

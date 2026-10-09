@@ -26,7 +26,7 @@ ControlStrip restarts and Touch Bar power events, and idles at 0% CPU.
 | **Touch Bar brightness** | Manual level, held across wake and ControlStrip restarts (no ambient sensor needed). |
 | **Keyboard backlight** | Manual level, restored on launch/wake only, so macOS idle dimming still works. |
 | **Monitor brightness** | Software dimming (gamma) for monitors without DDC, with a 12% floor so your only screen never goes black. Apple's Control Strip brightness button and the brightness keys drive it too. |
-| **Desktop stats** | When Finder or the screensaver is frontmost, the Touch Bar shows time · CPU · GPU · memory (GB and %) · temperature · fan RPM · network (or battery when unplugged/charging). Switching to any app gives the Touch Bar back. Tap the clock for the controls. |
+| **Desktop stats** | When Finder or the screensaver is frontmost, the Touch Bar shows time · CPU · GPU · memory (GB and %) · temperature · fan RPM · network · battery (charge and state: charging ⚡, on power 🔌, or on battery). Switching to any app gives the Touch Bar back. Tap the clock for the controls. |
 | **Display modes** | Resolution and refresh-rate switching, including HiDPI modes. |
 | **Fan control** | Auto (macOS), Smart, Custom RPM, or Max. Runs from boot as a small root daemon. Smart eases from minimum at 60 °C to maximum at 90 °C (≈1370 RPM at 65 °C, 2700 at 75 °C, 5370 at 85 °C on an M1 13"): it reacts fast to heat, cools down gently, ignores jitter, and goes to maximum if the sensors fail. |
 | **Mouse scroll direction** | Reverses wheel-mouse scrolling while the trackpad keeps natural scrolling, replacing tools like Scroll Reverser. Needs Accessibility permission. |

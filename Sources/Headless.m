@@ -652,7 +652,8 @@ static NSString *RateText(double bytesPerSecond) {
     return [NSString stringWithFormat:@"%.0fB", bytesPerSecond];
 }
 
-// nil when there is nothing worth showing (on AC power and not charging).
+// Charge level, with a symbol for the state: charging, on power (not charging), or on battery.
+// nil on Macs without a battery.
 static NSString *BatteryText(NSString **symbol) {
     NSString *text = nil;
     CFTypeRef info = IOPSCopyPowerSourcesInfo();
@@ -664,7 +665,7 @@ static NSString *BatteryText(NSString **symbol) {
         BOOL plugged = [d[@kIOPSPowerSourceStateKey] isEqualToString:@kIOPSACPowerValue];
         *symbol = [d[@kIOPSIsChargingKey] boolValue] ? @"battery.100.bolt"
             : level > 0.85 ? @"battery.100" : level > 0.6 ? @"battery.75" : level > 0.35 ? @"battery.50" : level > 0.15 ? @"battery.25" : @"battery.0";
-        if (plugged && ![d[@kIOPSIsChargingKey] boolValue]) break;
+        if (plugged && ![d[@kIOPSIsChargingKey] boolValue]) *symbol = @"powerplug.fill";
         text = [NSString stringWithFormat:@"%.0f%%", level * 100];
     }
     if (info) CFRelease(info);
@@ -818,14 +819,14 @@ static NSImage *Symbol(NSString *name, NSString *fallback) {
     NSDictionary *_textAttributes, *_clockAttributes;
 }
 
-static const CGFloat StatsGap = 8;
+static const CGFloat StatsGap = 6;
 
 static NSDictionary<NSString *, NSArray *> *StatSegments(void) {  // key → @[default symbol, width]
     static NSDictionary *segments;
     if (!segments) segments = @{
-        @"clock": @[@"", @110], @"cpu": @[@"cpu", @60], @"gpu": @[@"cube.transparent", @58],
-        @"memory": @[@"memorychip", @100], @"temp": @[@"thermometer.medium", @54], @"fan": @[@"fan.fill", @68],
-        @"network": @[@"", @92], @"battery": @[@"battery.100", @92],
+        @"clock": @[@"", @100], @"cpu": @[@"cpu", @56], @"gpu": @[@"cube.transparent", @54],
+        @"memory": @[@"memorychip", @94], @"temp": @[@"thermometer.medium", @50], @"fan": @[@"fan.fill", @62],
+        @"network": @[@"", @84], @"battery": @[@"battery.100", @72],
     };
     return segments;
 }
@@ -1299,10 +1300,10 @@ static BOOL ShowsStats(NSString *bundleID) {
 
 - (void)showStats:(id)sender {
     if (!self.statsBar) return;
-    // Battery takes the network slot when it matters (on battery or charging).
     NSString *symbol;
-    BOOL battery = BatteryText(&symbol) != nil;
-    self.statsView.segments = @[@"clock", @"cpu", @"gpu", @"memory", @"temp", @"fan", battery ? @"battery" : @"network"];
+    BOOL battery = BatteryText(&symbol) != nil;  // desktops have none
+    self.statsView.segments = battery ? @[@"clock", @"cpu", @"gpu", @"memory", @"temp", @"fan", @"network", @"battery"]
+                                      : @[@"clock", @"cpu", @"gpu", @"memory", @"temp", @"fan", @"network"];
     for (NSString *key in @[@"cpu", @"gpu", @"memory", @"network"]) [self.statsView setText:@"–" forSegment:key];
     double down, up;
     CPUUsage();  // prime the deltas; first real values arrive with the first tick
@@ -1349,11 +1350,10 @@ static BOOL ShowsStats(NSString *bundleID) {
     [view setText:isfinite(memory) ? [NSString stringWithFormat:@"%.1fG | %.0f%%", memoryGB, memory * 100] : @"–" forSegment:@"memory"];
     if (isfinite(temperature)) [view setText:[NSString stringWithFormat:@"%.0f°", temperature] forSegment:@"temp"];
     [view setText:isfinite(rpm) ? [NSString stringWithFormat:@"%.0f", rpm] : @"–" forSegment:@"fan"];
-    if ([view.segments containsObject:@"network"]) {
-        double down, up;
-        NetworkRates(&down, &up);
-        [view setText:[NSString stringWithFormat:@"↓%@ ↑%@", RateText(down), RateText(up)] forSegment:@"network"];
-    } else {
+    double down, up;
+    NetworkRates(&down, &up);
+    [view setText:[NSString stringWithFormat:@"↓%@ ↑%@", RateText(down), RateText(up)] forSegment:@"network"];
+    if ([view.segments containsObject:@"battery"]) {
         NSString *symbol = @"battery.100";
         NSString *battery = BatteryText(&symbol);
         [view setText:battery ?: @"–" forSegment:@"battery"];

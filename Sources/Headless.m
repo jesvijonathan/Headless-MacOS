@@ -3,6 +3,7 @@
 //   • keeps the built-in display disabled whenever an external one is active
 //   • manual Touch Bar + keyboard backlight brightness (no ambient light sensor)
 //   • fan modes (auto / smart curve / custom RPM / max) via the root headless-fand daemon
+//   • live CPU / memory / temperature / fan / battery stats on the Touch Bar at the desktop
 //   • external monitor brightness (software dimming), resolution / refresh
 //     rate, Night Shift, keep-awake, lock and display sleep, from the Control
 //     Strip, menu bar, global shortcuts (⌃⌥⌘) and a small CLI
@@ -18,6 +19,8 @@
 #import <Carbon/Carbon.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <IOKit/IOMessage.h>
+#import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/ps/IOPSKeys.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <notify.h>
@@ -25,6 +28,8 @@
 #import <os/log.h>
 #import <sys/socket.h>
 #import <sys/un.h>
+#import <ifaddrs.h>
+#import <net/if.h>
 
 #define HKChangedNotify "dev.jesvi.headless.changed"
 #define HKShowNotify "dev.jesvi.headless.show"
@@ -324,6 +329,30 @@ static void ApplyMonitor(void) {
     gMonitorDimmed = YES;
 }
 
+// macOS still keeps a "built-in display" brightness even with the panel gone; Apple's Control
+// Strip brightness button and the brightness keys change it. Mirror it both ways so those
+// controls dim the monitor instead of doing nothing.
+static id BuiltinBrightnessClient(void) {
+    static id client;
+    if (!client) {
+        dlopen("/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness", RTLD_NOW);
+        client = [[NSClassFromString(@"BrightnessSystemClient") alloc] initWithClientID:@"dev.jesvi.headless"];
+        if (![client respondsToSelector:@selector(setProperty:forKey:)]) client = nil;
+    }
+    return client;
+}
+
+static double BuiltinBrightness(void) {
+    NSDictionary *b = [BuiltinBrightnessClient() copyPropertyForKey:@"DisplayBrightness"];
+    NSNumber *n = [b isKindOfClass:NSDictionary.class] ? b[@"Brightness"] : nil;
+    return [n isKindOfClass:NSNumber.class] ? n.doubleValue : NAN;
+}
+
+static void SetBuiltinBrightness(double level) {
+    if (SettingBool(@"BrightnessKeysControlMonitor", YES) && fabs(BuiltinBrightness() - level) >= 0.01)
+        [BuiltinBrightnessClient() setProperty:@{@"Brightness": @(level)} forKey:@"DisplayBrightness"];
+}
+
 // Reconfiguration and wake reset gamma ramps; re-apply once things settle.
 static void ApplyMonitorSoon(double delay) {
     static uint64_t generation;
@@ -417,6 +446,95 @@ static NSString *FanSummary(NSDictionary *status) {
 
 static NSString *FanModeTitle(NSString *mode) {
     return @{@"auto": @"Auto", @"smart": @"Smart", @"custom": @"Custom", @"max": @"Max"}[mode] ?: mode;
+}
+
+#pragma mark - System stats
+
+static double CPUUsage(void) {
+    static host_cpu_load_info_data_t last;
+    host_cpu_load_info_data_t now;
+    mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
+    if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, (host_info_t)&now, &count) != KERN_SUCCESS) return NAN;
+    double busy = 0, total = 0;
+    for (int i = 0; i < CPU_STATE_MAX; i++) {
+        double ticks = (double)(now.cpu_ticks[i] - last.cpu_ticks[i]);
+        total += ticks;
+        if (i != CPU_STATE_IDLE) busy += ticks;
+    }
+    last = now;
+    return total > 0 ? busy / total : NAN;
+}
+
+// Roughly Activity Monitor's "Memory Used": app (active) + wired + compressed.
+static double MemoryUsage(void) {
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_size_t page = 0;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &count) != KERN_SUCCESS ||
+        host_page_size(mach_host_self(), &page) != KERN_SUCCESS) return NAN;
+    double used = (double)(vm.active_count + vm.wire_count + vm.compressor_page_count) * page;
+    return used / (double)NSProcessInfo.processInfo.physicalMemory;
+}
+
+static double GPUUsage(void) {
+    io_iterator_t iterator;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iterator) != KERN_SUCCESS) return NAN;
+    double usage = NAN;
+    io_object_t service;
+    while ((service = IOIteratorNext(iterator))) {
+        NSDictionary *stats = CFBridgingRelease(IORegistryEntryCreateCFProperty(service, CFSTR("PerformanceStatistics"), kCFAllocatorDefault, 0));
+        NSNumber *percent = [stats isKindOfClass:NSDictionary.class] ? stats[@"Device Utilization %"] : nil;
+        if ([percent isKindOfClass:NSNumber.class]) usage = fmax(isnan(usage) ? 0 : usage, percent.doubleValue / 100);
+        IOObjectRelease(service);
+    }
+    IOObjectRelease(iterator);
+    return usage;
+}
+
+// Bytes/s in and out across all non-loopback interfaces since the previous call.
+static void NetworkRates(double *down, double *up) {
+    static uint64_t lastIn, lastOut;
+    static CFAbsoluteTime lastTime;
+    uint64_t in = 0, out = 0;
+    struct ifaddrs *list;
+    if (getifaddrs(&list) != 0) { *down = *up = NAN; return; }
+    for (struct ifaddrs *i = list; i; i = i->ifa_next) {
+        if (!i->ifa_addr || i->ifa_addr->sa_family != AF_LINK || (i->ifa_flags & IFF_LOOPBACK) || !i->ifa_data) continue;
+        in += ((struct if_data *)i->ifa_data)->ifi_ibytes;
+        out += ((struct if_data *)i->ifa_data)->ifi_obytes;
+    }
+    freeifaddrs(list);
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    double elapsed = now - lastTime;
+    *down = lastTime && elapsed > 0 && in >= lastIn ? (in - lastIn) / elapsed : NAN;
+    *up = lastTime && elapsed > 0 && out >= lastOut ? (out - lastOut) / elapsed : NAN;
+    lastIn = in; lastOut = out; lastTime = now;
+}
+
+static NSString *RateText(double bytesPerSecond) {
+    if (!isfinite(bytesPerSecond)) return @"–";
+    if (bytesPerSecond >= 1e6) return [NSString stringWithFormat:@"%.1fM", bytesPerSecond / 1e6];
+    if (bytesPerSecond >= 1e3) return [NSString stringWithFormat:@"%.0fK", bytesPerSecond / 1e3];
+    return [NSString stringWithFormat:@"%.0fB", bytesPerSecond];
+}
+
+// nil when there is nothing worth showing (on AC power and not charging).
+static NSString *BatteryText(NSString **symbol) {
+    NSString *text = nil;
+    CFTypeRef info = IOPSCopyPowerSourcesInfo();
+    NSArray *sources = info ? CFBridgingRelease(IOPSCopyPowerSourcesList(info)) : nil;
+    for (id source in sources) {
+        NSDictionary *d = (__bridge NSDictionary *)IOPSGetPowerSourceDescription(info, (__bridge CFTypeRef)source);
+        if (![d[@kIOPSTypeKey] isEqualToString:@kIOPSInternalBatteryType]) continue;
+        double level = [d[@kIOPSCurrentCapacityKey] doubleValue] / fmax(1, [d[@kIOPSMaxCapacityKey] doubleValue]);
+        BOOL plugged = [d[@kIOPSPowerSourceStateKey] isEqualToString:@kIOPSACPowerValue];
+        *symbol = [d[@kIOPSIsChargingKey] boolValue] ? @"battery.100.bolt"
+            : level > 0.85 ? @"battery.100" : level > 0.6 ? @"battery.75" : level > 0.35 ? @"battery.50" : level > 0.15 ? @"battery.25" : @"battery.0";
+        if (plugged && ![d[@kIOPSIsChargingKey] boolValue]) break;
+        text = [NSString stringWithFormat:@"%.0f%%", level * 100];
+    }
+    if (info) CFRelease(info);
+    return text;
 }
 
 #pragma mark - Wake (both modes)
@@ -523,6 +641,11 @@ typedef NS_ENUM(UInt32, HKHotKey) {
 @property NSSlider *fanSlider;
 @property NSDictionary *fanStatus;
 @property NSDate *fanRefreshUntil;
+@property NSTouchBar *statsBar;
+@property NSDictionary<NSString *, NSButton *> *statButtons;
+@property NSTimer *statsTimer;
+@property NSTouchBar *presentedBar;
+@property NSDate *presentedAt;
 - (void)hotKey:(HKHotKey)key;
 @end
 
@@ -553,8 +676,8 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     int token;
     notify_register_dispatch(HKChangedNotify, &token, dispatch_get_main_queue(), ^(int t) { SettingsChangedElsewhere(); [weakSelf refreshControls]; });
     notify_register_dispatch(HKShowNotify, &token, dispatch_get_main_queue(), ^(int t) { [weakSelf showControls:nil]; });
-    for (NSString *page in @[@"display", @"touchbar", @"keyboard", @"monitor", @"fans"]) {
-        SEL action = NSSelectorFromString([NSString stringWithFormat:@"show%@Page:", [page isEqualToString:@"touchbar"] ? @"TouchBar" : [page isEqualToString:@"fans"] ? @"Fan" : page.capitalizedString]);
+    for (NSString *page in @[@"display", @"touchbar", @"keyboard", @"monitor", @"fans", @"stats"]) {
+        SEL action = [page isEqualToString:@"stats"] ? @selector(showStats:) : NSSelectorFromString([NSString stringWithFormat:@"show%@Page:", [page isEqualToString:@"touchbar"] ? @"TouchBar" : [page isEqualToString:@"fans"] ? @"Fan" : page.capitalizedString]);
         notify_register_dispatch([@HKShowNotify "." stringByAppendingString:page].UTF8String, &token, dispatch_get_main_queue(), ^(int t) {
             ((void (*)(id, SEL, id))objc_msgSend)(weakSelf, action, nil);
         });
@@ -567,6 +690,7 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     [self buildStatusItem];
     [self buildTouchBar];
     [self registerHotKeys];
+    [self observeBrightnessKeys];
     UpdateKeepAwake();
     EnforceHeadless();
     ApplyBrightnessSoon(0);
@@ -591,6 +715,15 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
 #pragma mark Control Strip
 
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    if (context == (__bridge void *)TrayID) {
+        NSTouchBar *bar = object;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (bar.visible) return;
+            if (self.presentedBar == bar) self.presentedBar = nil;
+            After(0.3, ^{ [self registerTray]; });
+        });
+        return;
+    }
     dispatch_async(dispatch_get_main_queue(), ^{ [self controlStripMayHaveChanged]; });
 }
 
@@ -599,7 +732,10 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     if (pid <= 0 || pid == self.controlStripPID) return;
     self.controlStripPID = pid;
     os_log(HKLog, "ControlStrip pid %d; registering tray item", pid);
-    After(0.5, ^{ [self registerTray]; ApplyTouchBar(); });
+    // A freshly launched ControlStrip can ignore registrations for a moment; repeat (idempotent).
+    for (NSNumber *delay in @[@0.5, @2, @5]) After(delay.doubleValue, ^{ [self registerTray]; });
+    After(0.5, ^{ ApplyTouchBar(); });
+    After(5.5, ^{ if (self.presentedBar == self.statsBar) self.presentedBar = nil; [self frontmostChanged:nil]; });
 }
 
 - (void)registerTray {
@@ -724,6 +860,7 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     self.mainBar.defaultItemIdentifiers = @[@"tb", @"kb", @"display", @"nightshift", @"awake", @"fans"];
 
     [self buildFanPages];
+    [self buildStatsBar];
 
     self.headlessButton = [self barButton:@"laptopcomputer" fallback:nil title:@"Built-in Off" action:@selector(toggleHeadless:)];
     NSScrubberFlowLayout *layout = [NSScrubberFlowLayout new];
@@ -750,6 +887,8 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     self.tray = [[NSCustomTouchBarItem alloc] initWithIdentifier:TrayID];
     self.tray.view = [self barButton:@"slider.horizontal.3" fallback:nil title:nil action:@selector(showControls:)];
     self.tray.view.accessibilityLabel = @"Headless controls";
+    [self watchVisibility:@[self.mainBar, self.displayBar, self.touchBarPage, self.keyboardPage, self.monitorPage,
+                            self.fanPage, self.fanCustomPage, self.statsBar]];
     // ControlStrip resolves private tray items through the app's current Touch Bar.
     NSApp.touchBar = self.mainBar;
     [self refreshControls];
@@ -809,6 +948,122 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
         [self item:@"value" view:self.fanValue label:@"RPM"],
     ]];
     self.fanCustomPage.defaultItemIdentifiers = @[@"back", NSTouchBarItemIdentifierFixedSpaceSmall, @"slider", @"value"];
+}
+
+// ⚙︎  CPU 12%  Mem 54%  63°  1650 rpm  100%   — shown while the desktop (Finder) is frontmost
+- (void)buildStatsBar {
+    NSMutableDictionary *buttons = [NSMutableDictionary dictionary];
+    NSMutableArray *items = [NSMutableArray array];
+    NSArray *specs = @[
+        @[@"clock", @"", @"showControls:", @110],
+        @[@"cpu", @"cpu", @"openActivityMonitor:", @60],
+        @[@"gpu", @"cube.transparent", @"openActivityMonitor:", @58],
+        @[@"memory", @"memorychip", @"openActivityMonitor:", @100],
+        @[@"temp", @"thermometer.medium", @"showFanPage:", @54],
+        @[@"fan", @"fan.fill", @"showFanPage:", @68],
+        @[@"network", @"", @"openActivityMonitor:", @92],
+        @[@"battery", @"battery.100", @"showControls:", @92],
+    ];
+    for (NSArray *spec in specs) {
+        BOOL clock = [spec[0] isEqualToString:@"clock"];
+        NSButton *button = [spec[1] length] == 0 ? [NSButton buttonWithTitle:@"–" target:self action:NSSelectorFromString(spec[2])]
+                                 : [self barButton:spec[1] fallback:@"circle" title:@"–" action:NSSelectorFromString(spec[2])];
+        button.font = [NSFont monospacedDigitSystemFontOfSize:13 weight:clock ? NSFontWeightMedium : NSFontWeightRegular];
+        button.imageHugsTitle = YES;
+        button.bordered = clock;  // the clock doubles as the "open controls" button
+        [button.widthAnchor constraintEqualToConstant:[spec[3] doubleValue]].active = YES;
+        buttons[spec[0]] = button;
+        [items addObject:[self item:spec[0] view:button label:spec[0]]];
+    }
+    self.statButtons = buttons;
+    self.statsBar = [NSTouchBar new];
+    self.statsBar.templateItems = [NSSet setWithArray:items];
+    self.statsBar.defaultItemIdentifiers = @[@"clock", @"cpu", @"gpu", @"memory", @"temp", @"fan", @"network"];
+    [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(frontmostChanged:) name:NSWorkspaceDidActivateApplicationNotification object:nil];
+    After(1, ^{ [self frontmostChanged:nil]; });
+}
+
+// The app area of the Touch Bar belongs to the frontmost app; at the desktop (Finder) show
+// stats there instead, and get out of the way as soon as any other app comes forward.
+- (void)frontmostChanged:(NSNotification *)note {
+    BOOL desktop = [NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier isEqualToString:@"com.apple.finder"];
+    BOOL ourPanelInUse = self.presentedBar && self.presentedBar != self.statsBar && self.presentedAt.timeIntervalSinceNow > -60;
+    if (desktop && SettingBool(@"DesktopStats", YES) && !ourPanelInUse) {
+        // A bar presented while the previous one is still closing gets dropped; let it settle.
+        After(0.5, ^{
+            if ([NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier isEqualToString:@"com.apple.finder"]) [self showStats:nil];
+        });
+    } else if (!desktop && self.presentedBar == self.statsBar) {
+        [self hideStats];
+    }
+}
+
+- (void)showStats:(id)sender {
+    if (!self.statsBar) return;
+    // Battery takes the network slot when it matters (on battery or charging).
+    NSString *symbol;
+    BOOL battery = BatteryText(&symbol) != nil;
+    self.statsBar.defaultItemIdentifiers = @[@"clock", @"cpu", @"gpu", @"memory", @"temp", @"fan", battery ? @"battery" : @"network"];
+    for (NSString *key in @[@"cpu", @"gpu", @"memory", @"network"]) self.statButtons[key].title = @"–";
+    double down, up;
+    CPUUsage();  // prime the deltas; first real values arrive with the first tick
+    NetworkRates(&down, &up);
+    [self present:self.statsBar];
+    After(0.6, ^{ [self updateStats]; });
+    [self.statsTimer invalidate];
+    self.statsTimer = [NSTimer scheduledTimerWithTimeInterval:2 repeats:YES block:^(NSTimer *t) { [self updateStats]; }];
+    self.statsTimer.tolerance = 0.5;
+}
+
+- (void)hideStats {
+    [self.statsTimer invalidate];
+    self.statsTimer = nil;
+    [NSTouchBar dismissSystemModalTouchBar:self.statsBar];
+    self.presentedBar = nil;
+}
+
+- (void)updateStats {
+    if (self.presentedBar != self.statsBar) { [self.statsTimer invalidate]; self.statsTimer = nil; return; }
+    static NSDateFormatter *time, *date;
+    if (!time) {
+        time = [NSDateFormatter new];
+        [time setLocalizedDateFormatFromTemplate:@"jmm"];   // follows the 12/24-hour setting
+        date = [NSDateFormatter new];
+        [date setLocalizedDateFormatFromTemplate:@"EEEd"];
+    }
+    NSDate *now = [NSDate date];
+    self.statButtons[@"clock"].title = [NSString stringWithFormat:@"%@ · %@", [time stringFromDate:now], [date stringFromDate:now]];
+    double cpu = CPUUsage(), memory = MemoryUsage();
+    self.statButtons[@"cpu"].title = isfinite(cpu) ? [NSString stringWithFormat:@"%.0f%%", cpu * 100] : @"–";
+    double memoryGB = memory * NSProcessInfo.processInfo.physicalMemory / 1073741824.0;
+    self.statButtons[@"memory"].title = isfinite(memory) ? [NSString stringWithFormat:@"%.1fG | %.0f%%", memoryGB, memory * 100] : @"–";
+    double gpu = GPUUsage(), down, up;
+    self.statButtons[@"gpu"].title = isfinite(gpu) ? [NSString stringWithFormat:@"%.0f%%", gpu * 100] : @"–";
+    NetworkRates(&down, &up);
+    self.statButtons[@"network"].title = [NSString stringWithFormat:@"↓%@ ↑%@", RateText(down), RateText(up)];
+    NSString *batterySymbol = @"battery.100";
+    NSString *battery = BatteryText(&batterySymbol);
+    self.statButtons[@"battery"].title = battery ?: @"–";
+    self.statButtons[@"battery"].image = Symbol(batterySymbol, @"bolt.fill");
+    FanRequestAsync(@"status", ^(NSDictionary *status) {
+        NSDictionary *fan = [status[@"fans"] firstObject];
+        self.statButtons[@"temp"].title = status ? [NSString stringWithFormat:@"%.0f°", [status[@"temp"] doubleValue]] : @"–";
+        self.statButtons[@"fan"].title = fan ? [NSString stringWithFormat:@"%.0f", [fan[@"rpm"] doubleValue]] : @"–";
+        self.statButtons[@"fan"].contentTintColor = [status[@"mode"] isEqualToString:@"auto"] || !status ? nil : NSColor.systemBlueColor;
+    });
+}
+
+- (void)openActivityMonitor:(id)sender {
+    [NSWorkspace.sharedWorkspace openApplicationAtURL:[NSURL fileURLWithPath:@"/System/Applications/Utilities/Activity Monitor.app"]
+                                        configuration:[NSWorkspaceOpenConfiguration configuration] completionHandler:nil];
+}
+
+- (void)toggleDesktopStats:(id)sender {
+    BOOL on = !SettingBool(@"DesktopStats", YES);
+    gSettings[@"DesktopStats"] = @(on);
+    SaveSettingsNow();
+    if (on) [self frontmostChanged:nil];
+    else if (self.presentedBar == self.statsBar) [self hideStats];
 }
 
 - (void)showFanPage:(id)sender {
@@ -871,9 +1126,17 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     });
 }
 
+// Closing a system-modal bar (✕, app switch, dismiss) drops our Control Strip item, so
+// re-register whenever one of our bars stops being visible.
+- (void)watchVisibility:(NSArray<NSTouchBar *> *)bars {
+    for (NSTouchBar *bar in bars) [bar addObserver:self forKeyPath:@"visible" options:0 context:(__bridge void *)TrayID];
+}
+
 - (void)present:(NSTouchBar *)bar {
     if (!bar) return;
     [self registerTray];
+    self.presentedBar = bar;
+    self.presentedAt = [NSDate date];
     [NSTouchBar presentSystemModalTouchBar:bar systemTrayItemIdentifier:TrayID];
 }
 
@@ -972,8 +1235,34 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     level = fmax(0, fmin(1, level));
     SetSetting(@"MonitorLevel", @(level));
     ApplyMonitor();
+    SetBuiltinBrightness(level);
     self.monitorSlider.doubleValue = round(level * 100);
     [self showValues];
+}
+
+- (void)observeBrightnessKeys {
+    id client = BuiltinBrightnessClient();
+    if (![client respondsToSelector:@selector(registerNotificationBlock:)] || ![client respondsToSelector:@selector(registerNotificationForKeys:)]) return;
+    __weak HKApp *weakSelf = self;
+    ((void (*)(id, SEL, id))objc_msgSend)(client, @selector(registerNotificationBlock:), ^(NSString *key, id value) {
+        NSNumber *n = [value isKindOfClass:NSDictionary.class] ? value[@"Brightness"] : nil;
+        if (![n isKindOfClass:NSNumber.class]) return;
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf builtinBrightnessChanged:n.doubleValue]; });
+    });
+    ((BOOL (*)(id, SEL, id))objc_msgSend)(client, @selector(registerNotificationForKeys:), @[@"DisplayBrightness"]);
+    SetBuiltinBrightness(SettingLevel(@"MonitorLevel", 1.0));
+}
+
+- (void)builtinBrightnessChanged:(double)level {
+    if (!SettingBool(@"BrightnessKeysControlMonitor", YES) || fabs(level - SettingLevel(@"MonitorLevel", 1.0)) < 0.01) return;
+    [self setMonitorLevel:level];
+    [self hud:@"sun.max.fill" text:[NSString stringWithFormat:@"Monitor  %.0f%%", level * 100]];
+}
+
+- (void)toggleBrightnessKeys:(id)sender {
+    gSettings[@"BrightnessKeysControlMonitor"] = @(!SettingBool(@"BrightnessKeysControlMonitor", YES));
+    SaveSettingsNow();
+    SetBuiltinBrightness(SettingLevel(@"MonitorLevel", 1.0));
 }
 
 - (void)monitorSliderMoved:(id)sender { [self setMonitorLevel:round([self sliderValue:sender]) / 100]; }
@@ -1027,6 +1316,7 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     if ([NSTouchBar respondsToSelector:@selector(dismissSystemModalTouchBar:)]) {
         [NSTouchBar dismissSystemModalTouchBar:self.mainBar];
         for (NSTouchBar *bar in @[self.displayBar, self.touchBarPage, self.keyboardPage, self.monitorPage, self.fanPage, self.fanCustomPage]) [NSTouchBar dismissSystemModalTouchBar:bar];
+        self.presentedBar = nil;
     }
 }
 
@@ -1295,12 +1585,18 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     NSMenuItem *night = [self menuItem:@"Night Shift" action:@selector(toggleNightShift:) key:@"n" symbol:@"moon"];
     night.state = NightShiftOn();
     [menu addItem:night];
+    NSMenuItem *stats = [self menuItem:@"System Stats on Desktop Touch Bar" action:@selector(toggleDesktopStats:) key:nil symbol:@"gauge.with.dots.needle.50percent"];
+    stats.state = SettingBool(@"DesktopStats", YES);
+    [menu addItem:stats];
 
     [menu addItem:NSMenuItem.separatorItem];
     [menu addItem:[self menuItem:@"Lock Screen" action:@selector(lock:) key:@"l" symbol:@"lock"]];
     [menu addItem:[self menuItem:@"Sleep Display" action:@selector(sleepDisplays:) key:@"s" symbol:@"zzz"]];
     [menu addItem:[self menuItem:@"Show Touch Bar Controls" action:@selector(showControls:) key:@"t" symbol:@"slider.horizontal.3"]];
     [menu addItem:[self menuItem:@"Re-apply Display Settings" action:@selector(reapply:) key:@"h" symbol:@"arrow.clockwise"]];
+    NSMenuItem *brightnessKeys = [self menuItem:@"Brightness Keys Control Monitor" action:@selector(toggleBrightnessKeys:) key:nil symbol:@"sun.max"];
+    brightnessKeys.state = SettingBool(@"BrightnessKeysControlMonitor", YES);
+    [menu addItem:brightnessKeys];
     [menu addItem:[self menuItem:@"Restart Touch Bar" action:@selector(restartTouchBar:) key:nil symbol:@"arrow.triangle.2.circlepath"]];
 
     [menu addItem:NSMenuItem.separatorItem];
@@ -1326,7 +1622,7 @@ static int Usage(void) {
         "  fan curve <low°C> <high°C>  smart-mode curve (default 60 90)\n"
         "  modes                       list modes for the external display\n"
         "  mode <index>                switch to a mode from `modes`\n"
-        "  lock | sleep-display | show [touchbar|keyboard|monitor|display|fans]\n");
+        "  lock | sleep-display | show [touchbar|keyboard|monitor|display|fans|stats]\n");
     return 2;
 }
 

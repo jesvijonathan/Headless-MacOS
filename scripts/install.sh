@@ -46,6 +46,18 @@ chown root:wheel "$plist"
 chmod 644 "$plist"
 plutil -lint "$plist" >/dev/null
 
+# Restore a saved config (make save-config) on a fresh install; never overwrite live settings.
+if [[ -f "$root/config/settings.plist" && ! -f "$settings" ]]; then
+    sudo -u "$user" mkdir -p "${settings:h}"
+    sudo -u "$user" cp "$root/config/settings.plist" "$settings"
+    echo "Restored settings from config/settings.plist"
+fi
+if [[ -f "$root/config/fan.plist" && ! -f "/Library/Application Support/Headless/fan.plist" ]]; then
+    mkdir -p "/Library/Application Support/Headless"
+    install -o root -g wheel -m 644 "$root/config/fan.plist" "/Library/Application Support/Headless/fan.plist"
+    echo "Restored fan mode from config/fan.plist"
+fi
+
 launchctl bootstrap "gui/$uid" "$plist"
 
 # Fan daemon (root). Stopping it hands the fans back to macOS.

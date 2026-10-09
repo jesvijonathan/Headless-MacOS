@@ -7,6 +7,7 @@ controls the fans, and adds headless-friendly toggles. It works from the Control
 shortcuts and a CLI.
 
 ![Main Touch Bar row](docs/touchbar-main.png)
+![Desktop stats](docs/touchbar-stats.png)
 
 ## Why
 
@@ -24,7 +25,8 @@ ControlStrip restarts and Touch Bar power events, and idles at 0% CPU.
 | **Built-in display off** | Disabled within ~0.5 s whenever it comes back while an external display is active. Backs off if something keeps re-enabling it. |
 | **Touch Bar brightness** | Manual level, held across wake and ControlStrip restarts (no ambient sensor needed). |
 | **Keyboard backlight** | Manual level, restored on launch/wake only, so macOS idle dimming still works. |
-| **Monitor brightness** | Software dimming (gamma) for monitors without DDC, with a 12% floor so your only screen never goes black. |
+| **Monitor brightness** | Software dimming (gamma) for monitors without DDC, with a 12% floor so your only screen never goes black. Apple's Control Strip brightness button and the brightness keys drive it too. |
+| **Desktop stats** | When Finder is frontmost, the Touch Bar shows time · CPU · GPU · memory (GB and %) · temperature · fan RPM · network (or battery when unplugged/charging). Switching to any app gives the Touch Bar back. Tap the clock for the controls. |
 | **Display modes** | Resolution and refresh-rate switching, including HiDPI modes. |
 | **Fan control** | Auto (macOS), Smart (temperature curve, 60–90 °C by default), Custom RPM, or Max. Runs from boot as a small root daemon. |
 | **Keep awake** | Prevents system sleep on AC power (like `caffeinate -s`); displays may still sleep. |
@@ -60,7 +62,7 @@ $H touchbar 70 | keyboard 40 | monitor 60
 $H headless on|off | awake on|off | nightshift toggle
 $H modes ; $H mode 3           # list / switch display modes
 $H fan [auto|smart|max|<rpm>]  # fan mode;  $H fan curve 55 85  # smart curve
-$H lock | sleep-display | show [touchbar|keyboard|monitor|display|fans]
+$H lock | sleep-display | show [touchbar|keyboard|monitor|display|fans|stats]
 ```
 
 These work well from Shortcuts.app ("Run Shell Script").
@@ -73,6 +75,18 @@ Requires macOS 14+ and the Xcode Command Line Tools (`xcode-select --install`).
 git clone https://github.com/<you>/headless && cd headless
 make install        # builds, then sudo-installs /Applications/Headless.app + a LaunchAgent
 ```
+
+### Fresh Mac / clean install
+
+```sh
+xcode-select --install          # once: compiler tools
+git clone https://github.com/<you>/headless && cd headless
+make install                    # agent + fan daemon, from boot, done
+```
+
+To carry your levels, toggles and fan mode over, run `make save-config` on the old Mac and
+commit `config/`. `make install` restores them, but only on a machine that has no settings
+yet, so it never overwrites live ones.
 
 Try it without installing: `make run`. Remove it with `make uninstall`. Your settings in
 `~/Library/Application Support/Headless/settings.plist` are kept.

@@ -947,7 +947,8 @@ typedef NS_ENUM(UInt32, HKHotKey) {
 @property NSTouchBar *presentedBar;
 @property NSDate *presentedAt;
 @property BOOL screensaverRunning;
-@property BOOL closingStatsOurselves;  // so only the user's ✕ on the stats opens the menu
+@property BOOL closingStatsOurselves;  // so only the user's ✕ on the stats returns to the menu
+@property BOOL statsFromMenu;          // stats opened with the menu's Stats button
 - (void)hotKey:(HKHotKey)key;
 @end
 
@@ -1026,10 +1027,11 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
             if (bar.visible) return;
             if (self.presentedBar == bar) self.presentedBar = nil;
             After(0.3, ^{ [self registerTray]; });
-            // ✕ on the stats steps back to the controls menu; ✕ there closes everything.
+            // ✕ on stats opened from the menu steps back to the menu; ✕ there closes everything.
             if (bar == self.statsBar) {
-                if (!self.closingStatsOurselves) After(0.3, ^{ [self showControls:nil]; });
+                if (!self.closingStatsOurselves && self.statsFromMenu) After(0.3, ^{ [self showControls:nil]; });
                 self.closingStatsOurselves = NO;
+                self.statsFromMenu = NO;
             }
         });
         return;
@@ -1150,7 +1152,7 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     self.awakeButton = [self barButton:@"cup.and.saucer.fill" fallback:@"bolt.fill" title:@"Awake" action:@selector(toggleAwake:)];
     self.nightShiftButton = [self barButton:@"moon.fill" fallback:nil title:@"Night" action:@selector(toggleNightShift:)];
     NSButton *fansButton = [self barButton:@"fan.fill" fallback:@"wind" title:@"Fans" action:@selector(showFanPage:)];
-    NSButton *statsButton = [self fixedWidth:52 button:[self barButton:@"gauge.with.dots.needle.50percent" fallback:@"chart.bar" title:nil action:@selector(showStats:)]];
+    NSButton *statsButton = [self fixedWidth:52 button:[self barButton:@"gauge.with.dots.needle.50percent" fallback:@"chart.bar" title:nil action:@selector(showStatsFromMenu:)]];
     NSButton *touchBarButton = [self barButton:@"sun.max.fill" fallback:nil title:@"Touch Bar" action:@selector(showTouchBarPage:)];
     NSButton *keyboardButton = [self barButton:@"keyboard" fallback:@"light.max" title:@"Keyboard" action:@selector(showKeyboardPage:)];
     // Labelled buttons only fit the ~640 pt modal area with a slightly smaller title.
@@ -1178,9 +1180,9 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     [self buildStatsBar];
 
     self.tray = [[NSCustomTouchBarItem alloc] initWithIdentifier:TrayID];
-    // Sits where Apple's (dead) brightness button was. Tap: stats; ✕ there: all controls.
-    self.tray.view = [self barButton:@"slider.horizontal.3" fallback:nil title:nil action:@selector(showStats:)];
-    self.tray.view.accessibilityLabel = @"Headless stats and controls";
+    // Sits where Apple's (dead) brightness button was. Tap: the controls menu.
+    self.tray.view = [self barButton:@"slider.horizontal.3" fallback:nil title:nil action:@selector(showControls:)];
+    self.tray.view.accessibilityLabel = @"Headless controls";
     [self watchVisibility:@[self.mainBar, self.statsBar]];
     After(2, ^{ [self updateControlStripLayout]; });
     // ControlStrip resolves private tray items through the app's current Touch Bar.
@@ -1311,6 +1313,11 @@ static BOOL ShowsStats(NSString *bundleID) {
     [self.statsTimer invalidate];
     self.statsTimer = [NSTimer scheduledTimerWithTimeInterval:2 repeats:YES block:^(NSTimer *t) { [self updateStats]; }];
     self.statsTimer.tolerance = 0.5;
+}
+
+- (void)showStatsFromMenu:(id)sender {
+    [self showStats:sender];
+    self.statsFromMenu = YES;
 }
 
 - (void)hideStats {

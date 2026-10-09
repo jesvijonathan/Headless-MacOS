@@ -37,8 +37,8 @@ ControlStrip restarts and Touch Bar power events, and idles at 0% CPU.
 ### Touch Bar
 
 Apple's Control Strip brightness button drives the missing built-in panel and does nothing,
-so Headless puts its own button in that slot. Tap it for the stats; ✕ there opens all
-controls, and ✕ again closes. To bring Apple's button back, untick "Replace Control Strip Brightness Button"
+so Headless puts its own button in that slot. Tap it for the controls; the gauge button
+there shows the stats (✕ returns to the controls). To bring Apple's button back, untick "Replace Control Strip Brightness Button"
 in the menu. Uninstalling also restores it. Each brightness control gets its own
 full-width page. Tap the end icons for ±10%.
 

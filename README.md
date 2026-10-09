@@ -81,7 +81,7 @@ These work well from Shortcuts.app ("Run Shell Script").
 Requires macOS 14+ and the Xcode Command Line Tools (`xcode-select --install`).
 
 ```sh
-git clone https://github.com/<you>/headless && cd headless
+git clone https://github.com/jesvijonathan/headless-mode-macos && cd headless-mode-macos
 make install        # builds, then sudo-installs /Applications/Headless.app + a LaunchAgent
 ```
 
@@ -89,7 +89,7 @@ make install        # builds, then sudo-installs /Applications/Headless.app + a 
 
 ```sh
 xcode-select --install          # once: compiler tools
-git clone https://github.com/<you>/headless && cd headless
+git clone https://github.com/jesvijonathan/headless-mode-macos && cd headless-mode-macos
 make install                    # agent + fan daemon, from boot, done
 ```
 

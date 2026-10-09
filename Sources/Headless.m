@@ -4,6 +4,7 @@
 //   • manual Touch Bar + keyboard backlight brightness (no ambient light sensor)
 //   • fan modes (auto / smart curve / custom RPM / max) via the root headless-fand daemon
 //   • live CPU / memory / temperature / fan / battery stats on the Touch Bar at the desktop
+//   • reversed scroll direction for wheel mice, leaving trackpad natural scrolling alone
 //   • external monitor brightness (software dimming), resolution / refresh
 //     rate, Night Shift, keep-awake, lock and display sleep, from the Control
 //     Strip, menu bar, global shortcuts (⌃⌥⌘) and a small CLI
@@ -616,6 +617,60 @@ static NSString *BatteryText(NSString **symbol) {
     return text;
 }
 
+#pragma mark - Mouse scroll direction
+
+// Wheel mice send scroll events with no gesture phase; trackpads (and Magic Mouse) do. So
+// with natural scrolling on for the trackpad, flipping phase-less events gives the mouse
+// the classic direction. Needs Accessibility permission to modify events.
+static CFMachPortRef gScrollTap;
+
+static CGEventRef ScrollTapped(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *info) {
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        if (gScrollTap) CGEventTapEnable(gScrollTap, true);
+        return event;
+    }
+    if (type != kCGEventScrollWheel ||
+        CGEventGetIntegerValueField(event, kCGScrollWheelEventScrollPhase) ||
+        CGEventGetIntegerValueField(event, kCGScrollWheelEventMomentumPhase)) return event;
+    int64_t line1 = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1);
+    int64_t line2 = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis2);
+    double fixedY = CGEventGetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis1);
+    double fixedX = CGEventGetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis2);
+    int64_t point1 = CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis1);
+    int64_t point2 = CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis2);
+    CGEventSetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1, -line1);
+    CGEventSetIntegerValueField(event, kCGScrollWheelEventDeltaAxis2, -line2);
+    CGEventSetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis1, -fixedY);
+    CGEventSetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis2, -fixedX);
+    CGEventSetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis1, -point1);
+    CGEventSetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis2, -point2);
+    return event;
+}
+
+static BOOL ScrollReversalActive(void) { return gScrollTap && CGEventTapIsEnabled(gScrollTap); }
+
+static void UpdateScrollReversal(BOOL promptForPermission) {
+    BOOL want = SettingBool(@"ReverseMouseScroll", NO);
+    if (want && !gScrollTap) {
+        NSDictionary *options = @{(__bridge id)kAXTrustedCheckOptionPrompt: @(promptForPermission)};
+        if (!AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options)) {
+            os_log(HKLog, "Mouse scroll reversal waiting for Accessibility permission");
+            return;
+        }
+        gScrollTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
+                                      CGEventMaskBit(kCGEventScrollWheel), ScrollTapped, NULL);
+        if (!gScrollTap) return;
+        CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(NULL, gScrollTap, 0);
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+        CFRelease(source);
+    } else if (!want && gScrollTap) {
+        CGEventTapEnable(gScrollTap, false);
+        CFMachPortInvalidate(gScrollTap);
+        CFRelease(gScrollTap);
+        gScrollTap = NULL;
+    }
+}
+
 #pragma mark - Wake (both modes)
 
 static void (^gOnWake)(void);
@@ -753,7 +808,7 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     [NSWorkspace.sharedWorkspace addObserver:self forKeyPath:@"runningApplications" options:0 context:NULL];
 
     int token;
-    notify_register_dispatch(HKChangedNotify, &token, dispatch_get_main_queue(), ^(int t) { SettingsChangedElsewhere(); [weakSelf refreshControls]; });
+    notify_register_dispatch(HKChangedNotify, &token, dispatch_get_main_queue(), ^(int t) { SettingsChangedElsewhere(); UpdateScrollReversal(YES); [weakSelf refreshControls]; });
     notify_register_dispatch(HKShowNotify, &token, dispatch_get_main_queue(), ^(int t) { [weakSelf showControls:nil]; });
     for (NSString *page in @[@"display", @"touchbar", @"keyboard", @"monitor", @"fans", @"stats"]) {
         SEL action = [page isEqualToString:@"stats"] ? @selector(showStats:) : NSSelectorFromString([NSString stringWithFormat:@"show%@Page:", [page isEqualToString:@"touchbar"] ? @"TouchBar" : [page isEqualToString:@"fans"] ? @"Fan" : page.capitalizedString]);
@@ -770,6 +825,9 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     [self buildTouchBar];
     [self registerHotKeys];
     [self observeBrightnessKeys];
+    UpdateScrollReversal(YES);
+    [NSDistributedNotificationCenter.defaultCenter addObserverForName:@"com.apple.accessibility.api" object:nil queue:NSOperationQueue.mainQueue
+                                                           usingBlock:^(NSNotification *n) { After(1, ^{ UpdateScrollReversal(NO); }); }];
     UpdateKeepAwake();
     EnforceHeadless();
     ApplyBrightnessSoon(0);
@@ -1034,7 +1092,7 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     NSMutableDictionary *buttons = [NSMutableDictionary dictionary];
     NSMutableArray *items = [NSMutableArray array];
     NSArray *specs = @[
-        @[@"clock", @"", @"showControls:", @110],
+        @[@"clock", @"", @"showControls:", @104],
         @[@"cpu", @"cpu", @"openActivityMonitor:", @60],
         @[@"gpu", @"cube.transparent", @"openActivityMonitor:", @58],
         @[@"memory", @"memorychip", @"openActivityMonitor:", @100],
@@ -1049,15 +1107,21 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
                                  : [self barButton:spec[1] fallback:@"circle" title:@"–" action:NSSelectorFromString(spec[2])];
         button.font = [NSFont monospacedDigitSystemFontOfSize:13 weight:clock ? NSFontWeightMedium : NSFontWeightRegular];
         button.imageHugsTitle = YES;
-        button.bordered = clock;  // the clock doubles as the "open controls" button
+        button.bordered = NO;  // the clock also opens the controls; plain text, like the stats
         [button.widthAnchor constraintEqualToConstant:[spec[3] doubleValue]].active = YES;
         buttons[spec[0]] = button;
         [items addObject:[self item:spec[0] view:button label:spec[0]]];
     }
     self.statButtons = buttons;
+    NSView *separator = [NSView new];
+    separator.wantsLayer = YES;
+    separator.layer.backgroundColor = NSColor.tertiaryLabelColor.CGColor;
+    [separator.widthAnchor constraintEqualToConstant:1].active = YES;
+    [separator.heightAnchor constraintEqualToConstant:20].active = YES;
+    [items addObject:[self item:@"separator" view:separator label:@"Separator"]];
     self.statsBar = [NSTouchBar new];
     self.statsBar.templateItems = [NSSet setWithArray:items];
-    self.statsBar.defaultItemIdentifiers = @[@"clock", @"cpu", @"gpu", @"memory", @"temp", @"fan", @"network"];
+    self.statsBar.defaultItemIdentifiers = @[@"clock", @"separator", @"cpu", @"gpu", @"memory", @"temp", @"fan", @"network"];
     [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(frontmostChanged:) name:NSWorkspaceDidActivateApplicationNotification object:nil];
     After(1, ^{ [self frontmostChanged:nil]; });
 }
@@ -1086,7 +1150,7 @@ static BOOL ShowsStats(NSString *bundleID) {
     // Battery takes the network slot when it matters (on battery or charging).
     NSString *symbol;
     BOOL battery = BatteryText(&symbol) != nil;
-    self.statsBar.defaultItemIdentifiers = @[@"clock", @"cpu", @"gpu", @"memory", @"temp", @"fan", battery ? @"battery" : @"network"];
+    self.statsBar.defaultItemIdentifiers = @[@"clock", @"separator", @"cpu", @"gpu", @"memory", @"temp", @"fan", battery ? @"battery" : @"network"];
     for (NSString *key in @[@"cpu", @"gpu", @"memory", @"network"]) self.statButtons[key].title = @"–";
     double down, up;
     CPUUsage();  // prime the deltas; first real values arrive with the first tick
@@ -1140,6 +1204,14 @@ static BOOL ShowsStats(NSString *bundleID) {
 - (void)openActivityMonitor:(id)sender {
     [NSWorkspace.sharedWorkspace openApplicationAtURL:[NSURL fileURLWithPath:@"/System/Applications/Utilities/Activity Monitor.app"]
                                         configuration:[NSWorkspaceOpenConfiguration configuration] completionHandler:nil];
+}
+
+- (void)toggleMouseScroll:(id)sender {
+    BOOL on = !SettingBool(@"ReverseMouseScroll", NO);
+    gSettings[@"ReverseMouseScroll"] = @(on);
+    SaveSettingsNow();
+    UpdateScrollReversal(YES);
+    [self hud:@"computermouse" text:on ? (ScrollReversalActive() ? @"Mouse Scroll Reversed" : @"Grant Accessibility") : @"Mouse Scroll Natural"];
 }
 
 - (void)toggleDesktopStats:(id)sender {
@@ -1669,6 +1741,10 @@ static BOOL ShowsStats(NSString *bundleID) {
     NSMenuItem *night = [self menuItem:@"Night Shift" action:@selector(toggleNightShift:) key:@"n" symbol:@"moon"];
     night.state = NightShiftOn();
     [menu addItem:night];
+    NSMenuItem *scroll = [self menuItem:@"Reverse Mouse Scrolling" action:@selector(toggleMouseScroll:) key:nil symbol:@"computermouse"];
+    scroll.state = SettingBool(@"ReverseMouseScroll", NO);
+    if (scroll.state && !ScrollReversalActive()) scroll.title = @"Reverse Mouse Scrolling (needs Accessibility)";
+    [menu addItem:scroll];
     NSMenuItem *stats = [self menuItem:@"System Stats on Desktop Touch Bar" action:@selector(toggleDesktopStats:) key:nil symbol:@"gauge.with.dots.needle.50percent"];
     stats.state = SettingBool(@"DesktopStats", YES);
     [menu addItem:stats];
@@ -1702,6 +1778,7 @@ static int Usage(void) {
         "  headless on|off             keep the built-in display disabled\n"
         "  awake on|off                prevent system sleep on AC power\n"
         "  nightshift on|off|toggle\n"
+        "  mousescroll reverse|natural  wheel-mouse direction (trackpad unchanged)\n"
         "  fan [auto|smart|max|<rpm>]  fan mode (needs the headless-fand daemon)\n"
         "  fan curve <low°C> <high°C>  smart-mode curve (default 60 90)\n"
         "  modes                       list modes for the external display\n"
@@ -1743,6 +1820,8 @@ static int RunCLI(int argc, const char **argv) {
         printf("keyboard      %s saved, %.0f%% actual\n", HasSetting(@"KeyboardLevel") ? [NSString stringWithFormat:@"%.0f%%", SettingLevel(@"KeyboardLevel", 1.0) * 100].UTF8String : "not", KeyboardCurrent() * 100);
         printf("keep awake    %s\n", SettingBool(@"KeepAwake", YES) ? "on" : "off");
         printf("night shift   %s\n", NightShiftOn() ? "on" : "off");
+        printf("mouse scroll  %s\n", !SettingBool(@"ReverseMouseScroll", NO) ? "natural (system setting)"
+               : AXIsProcessTrusted() ? "reversed" : "reversed - needs Accessibility permission for Headless");
         printf("temperature   %.0f°C (SoC, %lu sensors)\n", SocTemperature(), (unsigned long)SocSensors().count);
         printf("fan speed     %.0f rpm\n", FanRPM());
         NSDictionary *fans = FanRequest(@"status");
@@ -1755,6 +1834,10 @@ static int RunCLI(int argc, const char **argv) {
     else if ([cmd isEqualToString:@"keyboard"] && arg && ParsePercent(arg, &level)) { gSettings[@"KeyboardLevel"] = @(level); SaveSettingsNow(); if (!SetKeyboard(level)) return 1; }
     else if ([cmd isEqualToString:@"headless"] && arg && (on = ParseSwitch(arg)) >= 0) SetHeadless(on);
     else if ([cmd isEqualToString:@"awake"] && arg && (on = ParseSwitch(arg)) >= 0) { gSettings[@"KeepAwake"] = @(on); SaveSettingsNow(); }
+    else if ([cmd isEqualToString:@"mousescroll"] && arg && (!strcmp(arg, "reverse") || !strcmp(arg, "natural"))) {
+        gSettings[@"ReverseMouseScroll"] = @(!strcmp(arg, "reverse"));
+        SaveSettingsNow();
+    }
     else if ([cmd isEqualToString:@"nightshift"] && arg) {
         on = !strcmp(arg, "toggle") ? !NightShiftOn() : ParseSwitch(arg);
         if (on < 0) return Usage();

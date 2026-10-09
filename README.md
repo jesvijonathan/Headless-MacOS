@@ -29,6 +29,7 @@ ControlStrip restarts and Touch Bar power events, and idles at 0% CPU.
 | **Desktop stats** | When Finder or the screensaver is frontmost, the Touch Bar shows time · CPU · GPU · memory (GB and %) · temperature · fan RPM · network (or battery when unplugged/charging). Switching to any app gives the Touch Bar back. Tap the clock for the controls. |
 | **Display modes** | Resolution and refresh-rate switching, including HiDPI modes. |
 | **Fan control** | Auto (macOS), Smart (temperature curve, 60–90 °C by default), Custom RPM, or Max. Runs from boot as a small root daemon. |
+| **Mouse scroll direction** | Reverses wheel-mouse scrolling while the trackpad keeps natural scrolling, replacing tools like Scroll Reverser. Needs Accessibility permission. |
 | **Keep awake** | Prevents system sleep on AC power (like `caffeinate -s`); displays may still sleep. |
 | **Night Shift, Sleep display, Lock** | One tap or one shortcut. |
 | **From boot** | Runs in the login-window session too, so the display, brightness and awake state are applied before you sign in. |
@@ -59,7 +60,7 @@ full-width page. Tap the end icons for ±10%.
 H=/Applications/Headless.app/Contents/MacOS/Headless
 $H status                      # displays, levels, toggles
 $H touchbar 70 | keyboard 40 | monitor 60
-$H headless on|off | awake on|off | nightshift toggle
+$H headless on|off | awake on|off | nightshift toggle | mousescroll reverse|natural
 $H modes ; $H mode 3           # list / switch display modes
 $H fan [auto|smart|max|<rpm>]  # fan mode;  $H fan curve 55 85  # smart curve
 $H lock | sleep-display | show [touchbar|keyboard|monitor|display|fans|stats]
@@ -116,6 +117,9 @@ re-assert every 15 s. Auto does no work at all.
   Don't dim with both tools at once, or they'll fight over the gamma table.
 - **Fans:** fan control needs Apple Silicon (built and tested on M1). Smart mode uses the
   90th percentile of the CPU/GPU die sensors.
+- **Accessibility permission** (for mouse scroll reversal) is tied to the app's signature.
+  Builds are ad-hoc signed, so after a rebuild and reinstall, untick and re-tick Headless in
+  System Settings → Privacy & Security → Accessibility.
 - **Private APIs:** Headless uses SkyLight, DFRBrightness, CoreBrightness, DFRFoundation and
   undocumented SMC keys.
   A macOS update may break something; please open an issue.

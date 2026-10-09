@@ -916,7 +916,7 @@ static NSDictionary<NSString *, NSArray *> *StatSegments(void) {  // key → @[d
 typedef NS_ENUM(UInt32, HKHotKey) {
     HKTouchBarUp = 1, HKTouchBarDown, HKKeyboardUp, HKKeyboardDown,
     HKShowControls, HKReapply, HKLock, HKSleepDisplays, HKToggleAwake, HKToggleNightShift,
-    HKMonitorUp, HKMonitorDown, HKCycleFans,
+    HKMonitorUp, HKMonitorDown, HKCycleFans, HKShowStats,
 };
 
 @interface HKApp : NSObject <NSApplicationDelegate, NSMenuDelegate, NSScrubberDataSource, NSScrubberDelegate, NSScrubberFlowLayoutDelegate>
@@ -946,6 +946,7 @@ typedef NS_ENUM(UInt32, HKHotKey) {
 @property NSTimer *statsTimer;
 @property NSTouchBar *presentedBar;
 @property NSDate *presentedAt;
+@property BOOL screensaverRunning;
 - (void)hotKey:(HKHotKey)key;
 @end
 
@@ -1118,11 +1119,12 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     self.awakeButton = [self barButton:@"cup.and.saucer.fill" fallback:@"bolt.fill" title:@"Awake" action:@selector(toggleAwake:)];
     self.nightShiftButton = [self barButton:@"moon.fill" fallback:nil title:@"Night" action:@selector(toggleNightShift:)];
     NSButton *fansButton = [self barButton:@"fan.fill" fallback:@"wind" title:@"Fans" action:@selector(showFanPage:)];
+    NSButton *statsButton = [self fixedWidth:52 button:[self barButton:@"gauge.with.dots.needle.50percent" fallback:@"chart.bar" title:nil action:@selector(showStats:)]];
     NSButton *touchBarButton = [self barButton:@"sun.max.fill" fallback:nil title:@"Touch Bar" action:@selector(showTouchBarPage:)];
     NSButton *keyboardButton = [self barButton:@"keyboard" fallback:@"light.max" title:@"Keyboard" action:@selector(showKeyboardPage:)];
     // Labelled buttons only fit the ~640 pt modal area with a slightly smaller title.
     NSArray *row = @[touchBarButton, keyboardButton, self.displayButton, self.nightShiftButton, self.awakeButton, fansButton];
-    NSArray *widths = @[@102, @100, @92, @82, @86, @78];
+    NSArray *widths = @[@96, @104, @92, @72, @80, @72];
     for (NSUInteger i = 0; i < row.count; i++) {
         NSButton *button = row[i];
         button.font = [NSFont systemFontOfSize:13];
@@ -1136,10 +1138,11 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
         [self item:@"nightshift" view:self.nightShiftButton label:@"Night Shift"],
         [self item:@"awake" view:self.awakeButton label:@"Keep Awake"],
         [self item:@"fans" view:fansButton label:@"Fans"],
+        [self item:@"stats" view:statsButton label:@"System Stats"],
     ];
     self.mainBar = [NSTouchBar new];
     self.mainBar.templateItems = [NSSet setWithArray:mainItems];
-    self.mainBar.defaultItemIdentifiers = @[@"tb", @"kb", @"display", @"nightshift", @"awake", @"fans"];
+    self.mainBar.defaultItemIdentifiers = @[@"tb", @"kb", @"display", @"nightshift", @"awake", @"fans", @"stats"];
 
     [self buildStatsBar];
 
@@ -1222,6 +1225,10 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *co
     self.statsBar.templateItems = [NSSet setWithObject:[self item:@"stats" view:self.statsView label:@"System Stats"]];
     self.statsBar.defaultItemIdentifiers = @[@"stats"];
     [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(frontmostChanged:) name:NSWorkspaceDidActivateApplicationNotification object:nil];
+    // The screensaver does not reliably become the "active app"; it does announce itself.
+    NSDistributedNotificationCenter *center = NSDistributedNotificationCenter.defaultCenter;
+    [center addObserver:self selector:@selector(screensaverStarted:) name:@"com.apple.screensaver.didstart" object:nil];
+    [center addObserver:self selector:@selector(screensaverStopped:) name:@"com.apple.screensaver.didstop" object:nil];
     After(1, ^{ [self frontmostChanged:nil]; });
 }
 
@@ -1231,19 +1238,29 @@ static BOOL ShowsStats(NSString *bundleID) {
     return [@[@"com.apple.finder", @"com.apple.ScreenSaver.Engine"] containsObject:bundleID ?: @""];
 }
 
+- (BOOL)atDesktop {
+    return self.screensaverRunning || ShowsStats(NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier);
+}
+
 - (void)frontmostChanged:(NSNotification *)note {
     if (!gScrollTap) UpdateScrollReversal(NO);  // permission may have just been granted
-    BOOL desktop = ShowsStats(NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier);
-    BOOL ourPanelInUse = self.presentedBar && self.presentedBar != self.statsBar && self.presentedAt.timeIntervalSinceNow > -60;
-    if (desktop && SettingBool(@"DesktopStats", YES) && !ourPanelInUse) {
-        // A bar presented while the previous one is still closing gets dropped; let it settle.
+    // Don't cover a Headless panel the user has open right now.
+    BOOL ourPanelInUse = self.presentedBar && self.presentedBar != self.statsBar && self.presentedBar.visible;
+    if (self.atDesktop && SettingBool(@"DesktopStats", YES) && !ourPanelInUse) {
+        // A bar presented while the previous one is still closing gets dropped: let it settle,
+        // then check it actually appeared and retry once if not.
         After(0.5, ^{
-            if (ShowsStats(NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier)) [self showStats:nil];
+            if (!self.atDesktop) return;
+            [self showStats:nil];
+            After(1.0, ^{ if (self.atDesktop && !self.statsBar.visible) [self showStats:nil]; });
         });
-    } else if (!desktop && self.presentedBar == self.statsBar) {
+    } else if (!self.atDesktop && self.presentedBar == self.statsBar) {
         [self hideStats];
     }
 }
+
+- (void)screensaverStarted:(NSNotification *)note { self.screensaverRunning = YES; [self frontmostChanged:nil]; }
+- (void)screensaverStopped:(NSNotification *)note { self.screensaverRunning = NO; [self frontmostChanged:nil]; }
 
 - (void)showStats:(id)sender {
     if (!self.statsBar) return;
@@ -1675,7 +1692,7 @@ static BOOL ShowsStats(NSString *bundleID) {
         {HKKeyboardUp, kVK_RightArrow}, {HKKeyboardDown, kVK_LeftArrow},
         {HKShowControls, kVK_ANSI_T}, {HKReapply, kVK_ANSI_H}, {HKLock, kVK_ANSI_L},
         {HKSleepDisplays, kVK_ANSI_S}, {HKToggleAwake, kVK_ANSI_A}, {HKToggleNightShift, kVK_ANSI_N},
-        {HKMonitorUp, kVK_ANSI_Equal}, {HKMonitorDown, kVK_ANSI_Minus}, {HKCycleFans, kVK_ANSI_F},
+        {HKMonitorUp, kVK_ANSI_Equal}, {HKMonitorDown, kVK_ANSI_Minus}, {HKCycleFans, kVK_ANSI_F}, {HKShowStats, kVK_ANSI_I},
     };
     for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
         EventHotKeyRef ref;
@@ -1704,6 +1721,7 @@ static BOOL ShowsStats(NSString *bundleID) {
         case HKSleepDisplays: [self sleepDisplays:nil]; break;
         case HKToggleAwake: [self toggleAwake:nil]; break;
         case HKToggleNightShift: [self toggleNightShift:nil]; break;
+        case HKShowStats: [self showStats:nil]; break;
         case HKCycleFans: {
             FanRequestAsync(@"status", ^(NSDictionary *status) {
                 NSString *mode = status[@"mode"];
@@ -1935,6 +1953,7 @@ static BOOL ShowsStats(NSString *bundleID) {
     [menu addItem:[self menuItem:@"Lock Screen" action:@selector(lock:) key:@"l" symbol:@"lock"]];
     [menu addItem:[self menuItem:@"Sleep Display" action:@selector(sleepDisplays:) key:@"s" symbol:@"zzz"]];
     [menu addItem:[self menuItem:@"Show Touch Bar Controls" action:@selector(showControls:) key:@"t" symbol:@"slider.horizontal.3"]];
+    [menu addItem:[self menuItem:@"Show System Stats" action:@selector(showStats:) key:@"i" symbol:@"gauge.with.dots.needle.50percent"]];
     [menu addItem:[self menuItem:@"Re-apply Display Settings" action:@selector(reapply:) key:@"h" symbol:@"arrow.clockwise"]];
     NSMenuItem *brightnessKeys = [self menuItem:@"Brightness Keys Control Monitor" action:@selector(toggleBrightnessKeys:) key:nil symbol:@"sun.max"];
     brightnessKeys.state = SettingBool(@"BrightnessKeysControlMonitor", YES);
